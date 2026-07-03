@@ -1,14 +1,6 @@
 # FreeRADIUS GUI
 
-A small, self-contained web UI for configuring **FreeRADIUS 3.x** for **EAP-TLS certificate-based Wi-Fi authentication**.
-
-Think of it as a local, free/open-source alternative to pointing RADIUSaaS at Intune Cloud PKI. It focuses on the practical pieces needed for certificate-based Wi-Fi authentication:
-
-- The RADIUS server certificate and private key used during the TLS handshake.
-- The trusted CA bundle used to validate client/device certificates.
-- RADIUS clients, such as access points and Wi-Fi controllers, including their shared secrets.
-
-The GUI edits the real FreeRADIUS configuration files, validates the configuration with `freeradius -CX` before applying changes, and restarts the FreeRADIUS service when needed.
+A small vibecoded, self-contained web UI for configuring **FreeRADIUS 3.x** for **EAP-TLS certificate-based Wi-Fi authentication**.
 
 ---
 
