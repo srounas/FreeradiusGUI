@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% block title %}Certificates - FreeRADIUS GUI{% endblock %}
+{% block content %}
+<h1>Certificates</h1>
+
+<div class="card">
+  <h2>1. RADIUS server certificate</h2>
+  <p class="muted">
+    This is the certificate the RADIUS server presents to clients during EAP-TLS.
+    It should be issued by a CA your Wi-Fi clients already trust (e.g. your internal CA,
+    or the same root you use for Intune Cloud PKI client certs if you want a single trust chain).
+    On save, the certificate and key are parsed and checked that they actually match each other.
+  </p>
+  {% if info.server_cert and not info.server_cert.get('error') %}
+    <p><strong>Currently configured:</strong>
+      {% if info.server_cert.expired %}<span class="badge bad">EXPIRED</span>
+      {% elif info.server_cert.expiring_soon %}<span class="badge warn">EXPIRES IN {{ info.server_cert.days_left }} DAYS</span>
+      {% else %}<span class="badge ok">VALID</span>{% endif %}
+      {% if info.server_cert.is_ca %}<span class="badge warn">CA:TRUE - this looks like a CA cert, not a server cert</span>{% endif %}
+    </p>
+    <p class="muted">Subject: {{ info.server_cert.subject }}</p>
+    <p class="muted">Issuer: {{ info.server_cert.issuer }}</p>
+    <p class="muted">Expires: {{ info.server_cert.not_after }}</p>
+    <p class="muted">Fingerprint: {{ info.server_cert.fingerprint }}&hellip;</p>
+  {% else %}
+    <p class="muted">No server certificate configured yet.</p>
+  {% endif %}
+
+  <form method="post" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="action" value="upload_server">
+
+    <p class="muted"><strong>Option A - upload a PKCS#12 / PFX bundle</strong> (common export format
+      from Windows/Intune, contains both cert and key in one file)</p>
+    <label>PKCS#12 file (.p12 / .pfx)
+      <input type="file" name="p12_file" accept=".p12,.pfx">
+    </label>
+    <label>PKCS#12 password (leave blank if none)
+      <input type="password" name="p12_password">
+    </label>
+
+    <p class="muted"><strong>Option B - upload separate certificate and key files</strong> (PEM or DER, .crt/.cer/.pem/.key/.der all accepted)</p>
+    <label>Certificate file
+      <input type="file" name="cert_file" accept=".pem,.crt,.cer,.der">
+    </label>
+    <label>Private key file
+      <input type="file" name="key_file" accept=".pem,.key,.der">
+    </label>
+    <label>Private key password (leave blank if the key is not encrypted)
+      <input type="password" name="key_password">
+    </label>
+
+    <p class="muted"><strong>Option C - paste PEM text directly</strong></p>
+    <label>Server certificate (PEM, including any intermediate chain)
+      <textarea name="cert_pem" rows="6" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+    </label>
+    <label>Server private key (PEM)
+      <textarea name="key_pem" rows="6" placeholder="-----BEGIN PRIVATE KEY-----&#10;...&#10;-----END PRIVATE KEY-----"></textarea>
+    </label>
+
+    <p class="muted">Fill in exactly one of A, B, or C. The private key is stored unencrypted on
+      disk (permissions 640, root-owned) once saved here, same as FreeRADIUS itself expects.</p>
+    <button type="submit" class="primary">Save server certificate</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>2. Trusted CA bundle (client certificate validation)</h2>
+  <p class="muted">
+    The CA certificate(s) that issued your Wi-Fi client certificates (e.g. your Intune Cloud PKI
+    root/issuing CA export, or your internal CA chain). Any client certificate signed by one of
+    these CAs will be trusted for EAP-TLS. You can add certificates one at a time or all at once -
+    duplicates are detected automatically.
+  </p>
+  {% if info.ca_bundle %}
+    <p><strong>Currently configured ({{ info.ca_bundle|length }} certificate{{ 's' if info.ca_bundle|length != 1 else '' }}):</strong></p>
+    {% for c in info.ca_bundle %}
+      {% if not c.get('error') %}
+      <div class="ca-item">
+        <p class="muted">Subject: {{ c.subject }}
+          {% if c.expired %}<span class="badge bad">EXPIRED</span>
+          {% elif c.expiring_soon %}<span class="badge warn">EXPIRES IN {{ c.days_left }} DAYS</span>{% endif %}
+          {% if not c.is_ca %}<span class="badge warn">CA:FALSE - not marked as a CA cert</span>{% endif %}
+        </p>
+        <p class="muted">Expires: {{ c.not_after }} &middot; Fingerprint: {{ c.fingerprint }}&hellip;</p>
+        <form method="post" style="display:inline" onsubmit="return confirm('Remove this certificate from the trusted CA bundle?')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <input type="hidden" name="action" value="delete_ca_cert">
+          <input type="hidden" name="index" value="{{ loop.index0 }}">
+          <button type="submit" class="link-btn danger">remove</button>
+        </form>
+      </div>
+      {% endif %}
+    {% endfor %}
+  {% else %}
+    <p class="muted">No trusted CA configured yet.</p>
+  {% endif %}
+
+  <form method="post" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="action" value="upload_ca">
+    <label>Add mode
+      <select name="ca_mode">
+        <option value="append">Add to existing bundle</option>
+        <option value="replace">Replace entire bundle</option>
+      </select>
+    </label>
+    <label>CA certificate file (PEM, DER, or a PKCS#12 file containing just the CA cert)
+      <input type="file" name="ca_file_upload" accept=".pem,.crt,.cer,.der">
+    </label>
+    <label>Or a PKCS#12 file
+      <input type="file" name="ca_p12_file" accept=".p12,.pfx">
+    </label>
+    <label>PKCS#12 password (if applicable)
+      <input type="password" name="ca_p12_password">
+    </label>
+    <label>Or paste PEM text directly (one or more certificates concatenated)
+      <textarea name="ca_pem" rows="6" placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"></textarea>
+    </label>
+    <button type="submit" class="primary">Save trusted CA</button>
+  </form>
+</div>
+
+<p class="muted">After saving, go to the <a href="{{ url_for('dashboard') }}">Dashboard</a> and click "Apply &amp; restart" to activate the changes.</p>
+{% endblock %}

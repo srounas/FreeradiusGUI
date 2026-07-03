@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Settings - FreeRADIUS GUI{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+
+<div class="card">
+  <h2>Change admin password</h2>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="action" value="change_password">
+    <label>Current password
+      <input type="password" name="current_password" required>
+    </label>
+    <label>New password (min 8 characters)
+      <input type="password" name="new_password" required minlength="8">
+    </label>
+    <label>Confirm new password
+      <input type="password" name="confirm_password" required minlength="8">
+    </label>
+    <button type="submit" class="primary">Change password</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Environment</h2>
+  <p class="muted">Admin username: {{ admin_user }}</p>
+  <p class="muted">FreeRADIUS config dir: {{ raddb }}</p>
+  <p class="muted">Service name: {{ service_name }}</p>
+  <p class="muted">Auth log file: {{ auth_log_file or 'not detected yet - click Apply on the Dashboard once' }}</p>
+</div>
+{% endblock %}

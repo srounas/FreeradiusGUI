@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Log in - FreeRADIUS GUI{% endblock %}
+{% block content %}
+<div class="card login-card">
+  <h1>FreeRADIUS GUI</h1>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for category, message in messages %}
+        <div class="flash {{ category }}">{{ message }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+  <form method="post">
+    <label>Username
+      <input type="text" name="username" autofocus required>
+    </label>
+    <label>Password
+      <input type="password" name="password" required>
+    </label>
+    <button type="submit">Log in</button>
+  </form>
+</div>
+{% endblock %}

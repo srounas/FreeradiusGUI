@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Backup & Transfer - FreeRADIUS GUI{% endblock %}
+{% block content %}
+<h1>Backup &amp; Transfer</h1>
+<p class="muted">Export this server's RADIUS clients and/or certificates to a file, then import it on
+  another FreeRADIUS GUI instance to give it an identical configuration. Admin login and
+  host-specific settings (bind address, config paths) are never included - each server keeps its own.</p>
+
+<div class="card">
+  <h2>Export</h2>
+  <p class="muted">Currently {{ client_count }} client(s) configured.</p>
+  <form method="get" action="{{ url_for('backup_export') }}">
+    <label class="checkbox">
+      <input type="checkbox" name="clients" value="1" checked>
+      RADIUS clients ({{ client_count }})
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="certs" value="1" checked>
+      Server certificate + private key, and trusted CA bundle
+    </label>
+    <button type="submit" class="primary">Download export (.zip)</button>
+  </form>
+  <p class="muted">The export file contains shared secrets and the private key in plaintext -
+    handle it like you would the FreeRADIUS config itself.</p>
+</div>
+
+<div class="card">
+  <h2>Import</h2>
+  <p class="muted">Importing does not restart FreeRADIUS by itself - go to the Dashboard and click
+    Apply afterward to activate whatever you import here.</p>
+  <form method="post" action="{{ url_for('backup_import') }}" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label>Export file (.zip)
+      <input type="file" name="import_file" accept=".zip" required>
+    </label>
+
+    <label>RADIUS clients
+      <select name="clients_mode">
+        <option value="off">Don't import</option>
+        <option value="merge" selected>Merge (add new, keep existing - skip name conflicts)</option>
+        <option value="replace">Replace (overwrite this server's entire client list)</option>
+      </select>
+    </label>
+
+    <label class="checkbox">
+      <input type="checkbox" name="import_server_cert" value="1">
+      Import server certificate + private key (overwrites this server's current one)
+    </label>
+
+    <label>Trusted CA bundle
+      <select name="ca_mode">
+        <option value="off">Don't import</option>
+        <option value="append" selected>Add to existing bundle (dedup automatically)</option>
+        <option value="replace">Replace entire bundle</option>
+      </select>
+    </label>
+
+    <button type="submit" class="primary">Import selected</button>
+  </form>
+  <p class="muted">Everything imported here is validated the same way as a direct upload on the
+    Certificates page - a certificate/key that don't match each other, or a malformed client list,
+    will be rejected with a specific reason rather than silently applied.</p>
+</div>
+{% endblock %}

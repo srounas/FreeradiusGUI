@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}FreeRADIUS GUI{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+{% if session.get('authed') %}
+<nav class="topnav">
+  <div class="brand">FreeRADIUS GUI</div>
+  <a href="{{ url_for('dashboard') }}">Dashboard</a>
+  <a href="{{ url_for('certs') }}">Certificates</a>
+  <a href="{{ url_for('clients') }}">Clients</a>
+  <a href="{{ url_for('auth_log') }}">Auth Log</a>
+  <a href="{{ url_for('settings') }}">Settings</a>
+  <a href="{{ url_for('logout') }}" class="right">Log out</a>
+</nav>
+{% endif %}
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      <div class="flashes">
+      {% for category, message in messages %}
+        <div class="flash {{ category }}">{{ message }}</div>
+      {% endfor %}
+      </div>
+    {% endif %}
+  {% endwith %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

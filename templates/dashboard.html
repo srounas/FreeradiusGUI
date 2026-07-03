@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - FreeRADIUS GUI{% endblock %}
+{% block content %}
+<h1>Dashboard</h1>
+
+{% if cert_warning %}
+<div class="flash warn">One or more certificates are expired or expiring within 30 days - check the Certificates page.</div>
+{% endif %}
+{% if pending_changes %}
+<div class="flash warn">You have unsaved changes that haven't been applied yet - click Apply below to activate them.</div>
+{% endif %}
+
+<div class="card">
+  <h2>Setup checklist</h2>
+  <table>
+    <tbody>
+    {% for c in checks %}
+      <tr>
+        <td style="width:28px"><span class="badge {{ 'ok' if c.ok else 'warn' }}">{{ '✓' if c.ok else '!' }}</span></td>
+        <td>{{ c.label }}</td>
+        <td class="muted">{{ c.detail }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Service status</h2>
+    <p>freeradius service: <span class="badge {{ 'ok' if status == 'active' else 'bad' }}">{{ status }}</span></p>
+    {% if freeradius_version %}<p class="muted">Version: {{ freeradius_version }}</p>{% endif %}
+    <p class="muted">Config dir: {{ raddb }}</p>
+    {% if last_apply %}
+      <p class="muted">Last apply: {{ last_apply.time }}
+        <span class="badge {{ 'ok' if last_apply.success else 'bad' }}">{{ 'OK' if last_apply.success else 'FAILED' }}</span>
+      </p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Server certificate</h2>
+    {% if info.server_cert and not info.server_cert.get('error') %}
+      <p class="muted">Subject: {{ info.server_cert.subject }}</p>
+      <p class="muted">Expires: {{ info.server_cert.not_after }}
+        {% if info.server_cert.expired %}<span class="badge bad">EXPIRED</span>
+        {% elif info.server_cert.expiring_soon %}<span class="badge warn">{{ info.server_cert.days_left }}d left</span>{% endif %}
+      </p>
+    {% else %}
+      <p class="muted">No server certificate configured yet.</p>
+    {% endif %}
+    <a href="{{ url_for('certs') }}">Manage certificates &rarr;</a>
+  </div>
+
+  <div class="card">
+    <h2>Trusted CA bundle</h2>
+    {% if info.ca_bundle %}
+      <p class="muted">{{ info.ca_bundle|length }} certificate(s) in chain</p>
+      {% for c in info.ca_bundle %}
+        {% if c.expired %}<span class="badge bad">EXPIRED</span>{% elif c.expiring_soon %}<span class="badge warn">{{ c.days_left }}d left</span>{% endif %}
+      {% endfor %}
+    {% else %}
+      <p class="muted">No trusted CA configured yet.</p>
+    {% endif %}
+    <a href="{{ url_for('certs') }}">Manage certificates &rarr;</a>
+  </div>
+
+  <div class="card">
+    <h2>RADIUS clients</h2>
+    <p>{{ client_count }} client(s) configured</p>
+    <a href="{{ url_for('clients') }}">Manage clients &rarr;</a>
+  </div>
+
+  <div class="card">
+    <h2>Authentication activity (last hour)</h2>
+    <p><span class="badge ok">{{ auth_counts.accept }} accepted</span>
+       <span class="badge bad">{{ auth_counts.reject }} rejected</span></p>
+    <a href="{{ url_for('auth_log') }}">View auth log &rarr;</a>
+  </div>
+
+  <div class="card">
+    <h2>Backup &amp; Transfer</h2>
+    <p class="muted">Export/import clients and certificates, e.g. to clone this setup to another server.</p>
+    <a href="{{ url_for('backup') }}">Backup &amp; Transfer &rarr;</a>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Apply changes</h2>
+  <p class="muted">Writes clients.conf and eap.conf from your settings above. "Validate only" runs
+    <code>freeradius -CX</code> without touching the live service. "Apply &amp; restart" does the same
+    check and then restarts FreeRADIUS if it passes. Nothing changes on the live server until you click one of these.</p>
+  <div class="inline">
+    <form method="post" action="{{ url_for('validate') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit">Validate only</button>
+    </form>
+    <form method="post" action="{{ url_for('apply') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit" class="primary">Apply &amp; restart FreeRADIUS</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

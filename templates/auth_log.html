@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Auth Log - FreeRADIUS GUI{% endblock %}
+{% block content %}
+<h1>Authentication log</h1>
+
+<div class="card">
+  <form method="get" class="inline" style="align-items:flex-end; flex-wrap:wrap">
+    <label style="margin-bottom:0">Time range
+      <select name="range" onchange="this.form.submit()">
+        <option value="15" {{ 'selected' if minutes==15 }}>Last 15 minutes</option>
+        <option value="60" {{ 'selected' if minutes==60 }}>Last hour</option>
+        <option value="360" {{ 'selected' if minutes==360 }}>Last 6 hours</option>
+        <option value="1440" {{ 'selected' if minutes==1440 }}>Last 24 hours</option>
+      </select>
+    </label>
+    <label class="checkbox" style="margin-bottom:9px">
+      <input type="checkbox" name="autorefresh" value="1" {{ 'checked' if autorefresh }} onchange="this.form.submit()">
+      Auto-refresh every 15s
+    </label>
+    <noscript><button type="submit">Refresh</button></noscript>
+  </form>
+</div>
+
+{% if error %}
+<div class="card"><p class="muted">{{ error }}</p></div>
+{% else %}
+<div class="grid">
+  <div class="card">
+    <h2>Accepted</h2>
+    <p class="badge ok" style="font-size:1.2rem">{{ counts.accept }}</p>
+  </div>
+  <div class="card">
+    <h2>Rejected</h2>
+    <p class="badge bad" style="font-size:1.2rem">{{ counts.reject }}</p>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Events ({{ entries|length }})</h2>
+  {% if entries %}
+  <input type="text" id="filter-box" placeholder="Filter by user, client, MAC, or CN..." oninput="filterTable()" style="margin-bottom:12px">
+  <div style="overflow-x:auto">
+  <table id="events-table">
+    <thead><tr>
+      <th>Time</th><th>Result</th><th>User</th><th>NAS client</th><th>NAS IP</th>
+      <th>MAC (Calling-Station-Id)</th><th>Certificate CN</th><th>EAP type</th><th>Reason</th>
+    </tr></thead>
+    <tbody>
+    {% for e in entries %}
+      <tr>
+        <td class="muted">{{ e.time }}</td>
+        <td><span class="badge {{ 'ok' if e.outcome == 'Accept' else 'bad' }}">{{ e.outcome }}</span></td>
+        <td>{{ e.user }}</td>
+        <td>{{ e.client }}</td>
+        <td class="muted">{{ e.nas_ip }}</td>
+        <td class="muted">{{ e.calling_station }}</td>
+        <td class="muted">{{ e.cn }}</td>
+        <td class="muted">{{ e.eap_type }}</td>
+        <td class="muted">{{ e.reason }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="muted">No authentication events in this time range.</p>
+  {% endif %}
+</div>
+{% endif %}
+
+<p class="muted">Source: <code>{{ log_file or 'not detected yet' }}</code>. This is a dedicated log
+  written by a linelog module the GUI installs (see Settings) - not FreeRADIUS's default text log -
+  so all fields are structured and reliable.</p>
+
+<script>
+function filterTable() {
+  const q = document.getElementById('filter-box').value.toLowerCase();
+  document.querySelectorAll('#events-table tbody tr').forEach(row => {
+    row.style.display = row.innerText.toLowerCase().includes(q) ? '' : 'none';
+  });
+}
+</script>
+{% if autorefresh %}
+<script>setTimeout(() => location.reload(), 15000);</script>
+{% endif %}
+{% endblock %}

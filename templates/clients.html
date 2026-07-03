@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}Clients - FreeRADIUS GUI{% endblock %}
+{% block content %}
+<h1>RADIUS clients</h1>
+<p class="muted">These are your access points / Wi-Fi controllers - the devices that will send RADIUS
+  requests to this server. Each needs a unique shared secret, which you'll also enter on the AP/controller.</p>
+
+<div class="card">
+  <h2>Existing clients</h2>
+  {% if clients %}
+  <table>
+    <thead><tr><th>Name</th><th>IP / Network</th><th>Shortname</th><th>Secret</th><th></th></tr></thead>
+    <tbody>
+    {% for c in clients %}
+      <tr>
+        <td>{{ c.name }}</td>
+        <td>{{ c.ipaddr }}</td>
+        <td>{{ c.shortname }}</td>
+        <td><code class="secret" data-secret="{{ c.secret }}">••••••••</code>
+          <button type="button" class="link-btn" onclick="toggleSecret(this)">show</button>
+        </td>
+        <td>
+          <button type="button" class="link-btn" onclick="editClient('{{ c.name }}','{{ c.ipaddr }}','{{ c.shortname }}','{{ c.nas_type }}','{{ c.secret }}',{{ 'true' if c.require_message_authenticator else 'false' }})">edit</button>
+          <form method="post" style="display:inline" onsubmit="return confirm('Delete client {{ c.name }}?')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="action" value="delete">
+            <input type="hidden" name="name" value="{{ c.name }}">
+            <button type="submit" class="link-btn danger">delete</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No clients configured yet.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2 id="form-title">Add a client</h2>
+  <form method="post" id="client-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="action" value="add" id="form-action">
+    <input type="hidden" name="orig_name" id="orig_name">
+    <label>Name (unique identifier, e.g. ap-livingroom)
+      <input type="text" name="name" id="name" required>
+    </label>
+    <label>IP address or CIDR network (e.g. 192.168.1.50 or 192.168.1.0/24)
+      <input type="text" name="ipaddr" id="ipaddr" required>
+    </label>
+    <label>Shortname (optional, shown in logs)
+      <input type="text" name="shortname" id="shortname">
+    </label>
+    <label>NAS type (optional, e.g. other, cisco, unifi)
+      <input type="text" name="nas_type" id="nas_type">
+    </label>
+    <label>Shared secret
+      <div class="inline">
+        <input type="text" name="secret" id="secret" required>
+        <button type="button" onclick="genSecret()">Generate</button>
+      </div>
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="require_message_authenticator" id="require_message_authenticator">
+      Require Message-Authenticator (recommended for modern APs)
+    </label>
+    <button type="submit" class="primary">Save client</button>
+    <button type="button" onclick="resetForm()">Cancel edit</button>
+  </form>
+</div>
+
+<p class="muted">After saving, go to the <a href="{{ url_for('dashboard') }}">Dashboard</a> and click "Apply &amp; restart" to activate the changes.</p>
+
+<script>
+function genSecret() {
+  fetch("{{ url_for('generate_secret') }}").then(r => r.text()).then(s => {
+    document.getElementById('secret').value = s;
+  });
+}
+function editClient(name, ipaddr, shortname, nas_type, secret, requireMa) {
+  document.getElementById('form-title').innerText = 'Edit client: ' + name;
+  document.getElementById('form-action').value = 'edit';
+  document.getElementById('orig_name').value = name;
+  document.getElementById('name').value = name;
+  document.getElementById('ipaddr').value = ipaddr;
+  document.getElementById('shortname').value = shortname;
+  document.getElementById('nas_type').value = nas_type;
+  document.getElementById('secret').value = secret;
+  document.getElementById('require_message_authenticator').checked = requireMa;
+  window.scrollTo(0, document.body.scrollHeight);
+}
+function resetForm() {
+  document.getElementById('client-form').reset();
+  document.getElementById('form-title').innerText = 'Add a client';
+  document.getElementById('form-action').value = 'add';
+  document.getElementById('orig_name').value = '';
+}
+function toggleSecret(btn) {
+  const code = btn.previousElementSibling;
+  if (code.innerText === '••••••••') {
+    code.innerText = code.dataset.secret;
+    btn.innerText = 'hide';
+  } else {
+    code.innerText = '••••••••';
+    btn.innerText = 'show';
+  }
+}
+</script>
+{% endblock %}

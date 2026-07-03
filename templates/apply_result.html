@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Apply result - FreeRADIUS GUI{% endblock %}
+{% block content %}
+<h1>{{ 'Validation result' if validate_only else 'Apply result' }}</h1>
+<p class="badge {{ 'ok' if success else 'bad' }}">{{ 'VALID' if (success and validate_only) else ('SUCCESS' if success else 'FAILED') }}</p>
+<div class="card">
+  <pre class="log">{% for line in log %}{{ line }}
+{% endfor %}</pre>
+</div>
+<a href="{{ url_for('dashboard') }}">&larr; Back to dashboard</a>
+{% endblock %}
