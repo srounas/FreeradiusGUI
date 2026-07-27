@@ -336,6 +336,26 @@ Existing admin credentials and settings are preserved. The installer redeploys t
 
 After upgrading, open the Dashboard and click **Apply** once so the current version can install or update its FreeRADIUS logging hooks.
 
+### Running behind a reverse proxy
+
+By default the GUI identifies clients by their direct TCP source address, and
+ignores any `X-Forwarded-For` header - a client can set that header to
+whatever it likes, so trusting it by default would let anyone forge their
+source IP and dodge the login-attempt lockout.
+
+If you deliberately put FreeRADIUS GUI behind a reverse proxy (nginx, HAProxy,
+etc.) on the same host and want the lockout and audit log to reflect the
+real client IP the proxy saw, add this to `/etc/freeradius-gui/config.json`
+and restart the service:
+
+```json
+"trust_proxy_headers": true
+```
+
+Only enable this if the GUI is not directly reachable except through that
+proxy - otherwise a client can still bypass it by talking to the GUI port
+directly and setting the header itself.
+
 ---
 
 ## Cloning configuration to multiple servers

@@ -54,6 +54,11 @@ EAP_TYPE_NAMES = {
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5MB, generous for certs
+# Harden the session cookie: JS can't read it, browser won't send it on
+# cross-site requests, and (once TLS is on, which is the default) it's
+# never sent in the clear.
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 
 # --------------------------------------------------------------------------
@@ -76,6 +81,30 @@ def _persist_state():
 STATE = load_state()
 app.secret_key = STATE["secret_key"]
 app.permanent_session_lifetime = timedelta(minutes=SESSION_LIFETIME_MINUTES)
+
+GUI_TLS_ENABLED = bool(STATE.get("gui_tls_cert") and STATE.get("gui_tls_key")
+                        and Path(STATE["gui_tls_cert"]).exists())
+# Only mark the cookie Secure (HTTPS-only) when we're actually serving HTTPS -
+# otherwise the browser would silently refuse to store/send it at all.
+app.config["SESSION_COOKIE_SECURE"] = GUI_TLS_ENABLED
+
+# Trust X-Forwarded-For only when the app is deliberately run behind a
+# reverse proxy on this host (config-driven), never by default - otherwise
+# any client can forge the header to spoof its source IP and dodge the
+# login-attempt lockout entirely.
+TRUST_PROXY_HEADERS = bool(STATE.get("trust_proxy_headers", False))
+
+
+@app.after_request
+def set_security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "same-origin"
+    resp.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data:"
+    if GUI_TLS_ENABLED:
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return resp
+
 
 RADDB = Path(STATE["raddb_dir"])
 CERTS_DIR = RADDB / "certs"
@@ -137,16 +166,36 @@ def enforce_csrf():
 
 
 def client_ip():
-    return request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
+    if TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            # Left-most entry is the original client per the de-facto standard.
+            return forwarded.split(",")[0].strip() or "unknown"
+    return request.remote_addr or "unknown"
+
+
+def _prune_failed_logins():
+    now = time.time()
+    for ip in list(_failed_logins):
+        attempts = [t for t in _failed_logins[ip] if now - t < LOGIN_LOCKOUT_SECONDS]
+        if attempts:
+            _failed_logins[ip] = attempts
+        else:
+            del _failed_logins[ip]
 
 
 def is_locked_out(ip):
-    attempts = [t for t in _failed_logins.get(ip, []) if time.time() - t < LOGIN_LOCKOUT_SECONDS]
+    now = time.time()
+    attempts = [t for t in _failed_logins.get(ip, []) if now - t < LOGIN_LOCKOUT_SECONDS]
     _failed_logins[ip] = attempts
     return len(attempts) >= MAX_LOGIN_ATTEMPTS
 
 
 def record_failed_login(ip):
+    # Cheap opportunistic sweep of every IP's stale attempts, not just this
+    # one, so the table doesn't grow forever from one-off scanner traffic.
+    if len(_failed_logins) > 200:
+        _prune_failed_logins()
     _failed_logins.setdefault(ip, []).append(time.time())
 
 
@@ -520,6 +569,9 @@ def render_clients_conf(clients):
 
 def write_clients_conf(clients):
     CLIENTS_CONF.write_text(render_clients_conf(clients))
+    # Contains shared secrets in plaintext - keep it as locked down as the
+    # other secret-bearing files this app manages.
+    os.chmod(CLIENTS_CONF, 0o640)
 
 
 # --------------------------------------------------------------------------
@@ -658,7 +710,11 @@ def parse_auth_log(log_file, minutes, max_lines=50000):
             "itself on the first authentication attempt.)"
         )
 
-    cutoff = datetime.now().timestamp() - minutes * 60
+    # minutes <= 0 means "all time" - don't filter anything out by age, just
+    # by how many lines we tail. Entries were disappearing from the Auth Log
+    # page purely because they aged past whatever window was selected, which
+    # looked like data loss even though the log file itself was untouched.
+    cutoff = (datetime.now().timestamp() - minutes * 60) if minutes > 0 else 0
     entries = []
     counts = {"accept": 0, "reject": 0}
 
@@ -823,7 +879,11 @@ def certs():
                   "Go to Dashboard and click Apply.", "success")
 
         elif action == "delete_ca_cert":
-            idx = int(request.form.get("index", -1))
+            try:
+                idx = int(request.form.get("index", -1))
+            except ValueError:
+                flash("Invalid certificate index", "error")
+                return redirect(url_for("certs"))
             if paths["ca_bundle"].exists():
                 try:
                     certs_list = [_cert_to_pem(c) for c in _load_all_certs(paths["ca_bundle"].read_bytes())]
@@ -914,7 +974,10 @@ def auth_log():
         minutes = 60
     autorefresh = request.args.get("autorefresh") == "1"
     log_file = STATE.get("auth_log_file") or (auth_log_path() if RADIUSD_CONF.exists() else None)
-    entries, counts, err = parse_auth_log(log_file, minutes)
+    # "All time" (minutes<=0) needs a much bigger tail buffer, since a wide
+    # window on a busy server can span far more than the usual 50k-line default.
+    max_lines = 500000 if minutes <= 0 else 50000
+    entries, counts, err = parse_auth_log(log_file, minutes, max_lines=max_lines)
     return render_template(
         "auth_log.html", entries=entries, counts=counts, error=err,
         minutes=minutes, autorefresh=autorefresh, log_file=log_file,

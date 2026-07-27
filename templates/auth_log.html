@@ -11,6 +11,8 @@
         <option value="60" {{ 'selected' if minutes==60 }}>Last hour</option>
         <option value="360" {{ 'selected' if minutes==360 }}>Last 6 hours</option>
         <option value="1440" {{ 'selected' if minutes==1440 }}>Last 24 hours</option>
+        <option value="10080" {{ 'selected' if minutes==10080 }}>Last 7 days</option>
+        <option value="0" {{ 'selected' if minutes==0 }}>All time (in current log)</option>
       </select>
     </label>
     <label class="checkbox" style="margin-bottom:9px">
@@ -70,7 +72,8 @@
 
 <p class="muted">Source: <code>{{ log_file or 'not detected yet' }}</code>. This is a dedicated log
   written by a linelog module the GUI installs (see Settings) - not FreeRADIUS's default text log -
-  so all fields are structured and reliable.</p>
+  so all fields are structured and reliable. "All time" covers everything in the current log file;
+  older entries that have already been rotated out (see logrotate config) aren't included.</p>
 
 <script>
 function filterTable() {

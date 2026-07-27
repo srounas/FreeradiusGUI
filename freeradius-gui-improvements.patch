@@ -1,0 +1,276 @@
+diff --git a/README.md b/README.md
+index 9df9c77..b376218 100644
+--- a/README.md
++++ b/README.md
+@@ -336,6 +336,26 @@ Existing admin credentials and settings are preserved. The installer redeploys t
+ 
+ After upgrading, open the Dashboard and click **Apply** once so the current version can install or update its FreeRADIUS logging hooks.
+ 
++### Running behind a reverse proxy
++
++By default the GUI identifies clients by their direct TCP source address, and
++ignores any `X-Forwarded-For` header - a client can set that header to
++whatever it likes, so trusting it by default would let anyone forge their
++source IP and dodge the login-attempt lockout.
++
++If you deliberately put FreeRADIUS GUI behind a reverse proxy (nginx, HAProxy,
++etc.) on the same host and want the lockout and audit log to reflect the
++real client IP the proxy saw, add this to `/etc/freeradius-gui/config.json`
++and restart the service:
++
++```json
++"trust_proxy_headers": true
++```
++
++Only enable this if the GUI is not directly reachable except through that
++proxy - otherwise a client can still bypass it by talking to the GUI port
++directly and setting the header itself.
++
+ ---
+ 
+ ## Cloning configuration to multiple servers
+diff --git a/app.py b/app.py
+index 28d7f8b..24cc706 100644
+--- a/app.py
++++ b/app.py
+@@ -54,6 +54,11 @@ EAP_TYPE_NAMES = {
+ 
+ app = Flask(__name__)
+ app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5MB, generous for certs
++# Harden the session cookie: JS can't read it, browser won't send it on
++# cross-site requests, and (once TLS is on, which is the default) it's
++# never sent in the clear.
++app.config["SESSION_COOKIE_HTTPONLY"] = True
++app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -77,6 +82,30 @@ STATE = load_state()
+ app.secret_key = STATE["secret_key"]
+ app.permanent_session_lifetime = timedelta(minutes=SESSION_LIFETIME_MINUTES)
+ 
++GUI_TLS_ENABLED = bool(STATE.get("gui_tls_cert") and STATE.get("gui_tls_key")
++                        and Path(STATE["gui_tls_cert"]).exists())
++# Only mark the cookie Secure (HTTPS-only) when we're actually serving HTTPS -
++# otherwise the browser would silently refuse to store/send it at all.
++app.config["SESSION_COOKIE_SECURE"] = GUI_TLS_ENABLED
++
++# Trust X-Forwarded-For only when the app is deliberately run behind a
++# reverse proxy on this host (config-driven), never by default - otherwise
++# any client can forge the header to spoof its source IP and dodge the
++# login-attempt lockout entirely.
++TRUST_PROXY_HEADERS = bool(STATE.get("trust_proxy_headers", False))
++
++
++@app.after_request
++def set_security_headers(resp):
++    resp.headers["X-Content-Type-Options"] = "nosniff"
++    resp.headers["X-Frame-Options"] = "DENY"
++    resp.headers["Referrer-Policy"] = "same-origin"
++    resp.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data:"
++    if GUI_TLS_ENABLED:
++        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
++    return resp
++
++
+ RADDB = Path(STATE["raddb_dir"])
+ CERTS_DIR = RADDB / "certs"
+ EAP_CONF = RADDB / "mods-available" / "eap"
+@@ -137,16 +166,36 @@ def enforce_csrf():
+ 
+ 
+ def client_ip():
+-    return request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
++    if TRUST_PROXY_HEADERS:
++        forwarded = request.headers.get("X-Forwarded-For")
++        if forwarded:
++            # Left-most entry is the original client per the de-facto standard.
++            return forwarded.split(",")[0].strip() or "unknown"
++    return request.remote_addr or "unknown"
++
++
++def _prune_failed_logins():
++    now = time.time()
++    for ip in list(_failed_logins):
++        attempts = [t for t in _failed_logins[ip] if now - t < LOGIN_LOCKOUT_SECONDS]
++        if attempts:
++            _failed_logins[ip] = attempts
++        else:
++            del _failed_logins[ip]
+ 
+ 
+ def is_locked_out(ip):
+-    attempts = [t for t in _failed_logins.get(ip, []) if time.time() - t < LOGIN_LOCKOUT_SECONDS]
++    now = time.time()
++    attempts = [t for t in _failed_logins.get(ip, []) if now - t < LOGIN_LOCKOUT_SECONDS]
+     _failed_logins[ip] = attempts
+     return len(attempts) >= MAX_LOGIN_ATTEMPTS
+ 
+ 
+ def record_failed_login(ip):
++    # Cheap opportunistic sweep of every IP's stale attempts, not just this
++    # one, so the table doesn't grow forever from one-off scanner traffic.
++    if len(_failed_logins) > 200:
++        _prune_failed_logins()
+     _failed_logins.setdefault(ip, []).append(time.time())
+ 
+ 
+@@ -520,6 +569,9 @@ def render_clients_conf(clients):
+ 
+ def write_clients_conf(clients):
+     CLIENTS_CONF.write_text(render_clients_conf(clients))
++    # Contains shared secrets in plaintext - keep it as locked down as the
++    # other secret-bearing files this app manages.
++    os.chmod(CLIENTS_CONF, 0o640)
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -658,7 +710,11 @@ def parse_auth_log(log_file, minutes, max_lines=50000):
+             "itself on the first authentication attempt.)"
+         )
+ 
+-    cutoff = datetime.now().timestamp() - minutes * 60
++    # minutes <= 0 means "all time" - don't filter anything out by age, just
++    # by how many lines we tail. Entries were disappearing from the Auth Log
++    # page purely because they aged past whatever window was selected, which
++    # looked like data loss even though the log file itself was untouched.
++    cutoff = (datetime.now().timestamp() - minutes * 60) if minutes > 0 else 0
+     entries = []
+     counts = {"accept": 0, "reject": 0}
+ 
+@@ -823,7 +879,11 @@ def certs():
+                   "Go to Dashboard and click Apply.", "success")
+ 
+         elif action == "delete_ca_cert":
+-            idx = int(request.form.get("index", -1))
++            try:
++                idx = int(request.form.get("index", -1))
++            except ValueError:
++                flash("Invalid certificate index", "error")
++                return redirect(url_for("certs"))
+             if paths["ca_bundle"].exists():
+                 try:
+                     certs_list = [_cert_to_pem(c) for c in _load_all_certs(paths["ca_bundle"].read_bytes())]
+@@ -914,7 +974,10 @@ def auth_log():
+         minutes = 60
+     autorefresh = request.args.get("autorefresh") == "1"
+     log_file = STATE.get("auth_log_file") or (auth_log_path() if RADIUSD_CONF.exists() else None)
+-    entries, counts, err = parse_auth_log(log_file, minutes)
++    # "All time" (minutes<=0) needs a much bigger tail buffer, since a wide
++    # window on a busy server can span far more than the usual 50k-line default.
++    max_lines = 500000 if minutes <= 0 else 50000
++    entries, counts, err = parse_auth_log(log_file, minutes, max_lines=max_lines)
+     return render_template(
+         "auth_log.html", entries=entries, counts=counts, error=err,
+         minutes=minutes, autorefresh=autorefresh, log_file=log_file,
+diff --git a/static/style.css b/static/style.css
+index 6ce0f26..dd26c0c 100644
+--- a/static/style.css
++++ b/static/style.css
+@@ -3,12 +3,12 @@
+   --panel: #171e2e;
+   --panel-border: #2a3348;
+   --text: #e6e9f0;
+-  --muted: #8b93a7;
+-  --accent: #4f8cff;
+-  --accent-hover: #6ba0ff;
+-  --ok: #2fbf71;
+-  --bad: #e5484d;
+-  --warn: #e6a837;
++  --muted: #9aa4bd;
++  --accent: #5b9dff;
++  --accent-hover: #82b4ff;
++  --ok: #35d488;
++  --bad: #ff5f66;
++  --warn: #ffb648;
+   --radius: 8px;
+ }
+ 
+@@ -39,9 +39,9 @@ h2 { font-size: 1.1rem; margin: 0 0 12px; }
+   background: var(--panel);
+   border-bottom: 1px solid var(--panel-border);
+ }
+-.topnav .brand { font-weight: 600; margin-right: 12px; }
++.topnav .brand { font-weight: 600; margin-right: 12px; color: var(--text); }
+ .topnav a { color: var(--muted); text-decoration: none; font-size: 0.95rem; }
+-.topnav a:hover { color: var(--text); }
++.topnav a:hover { color: var(--accent-hover); }
+ .topnav .right { margin-left: auto; }
+ 
+ .card {
+@@ -85,6 +85,12 @@ input[type=text], input[type=password], textarea {
+ }
+ textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; resize: vertical; }
+ 
++input[type=text]:focus, input[type=password]:focus, textarea:focus, select:focus, button:focus-visible {
++  outline: none;
++  border-color: var(--accent);
++  box-shadow: 0 0 0 3px rgba(91,157,255,0.25);
++}
++
+ .inline { display: flex; gap: 8px; }
+ .inline input { flex: 1; }
+ 
+@@ -111,7 +117,9 @@ button.primary:hover { background: var(--accent-hover); }
+   padding: 2px 4px;
+   font-size: 0.85rem;
+ }
++.link-btn:hover { color: var(--accent-hover); text-decoration: underline; }
+ .link-btn.danger { color: var(--bad); }
++.link-btn.danger:hover { color: #ff8b90; }
+ 
+ table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+ th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--panel-border); }
+@@ -126,10 +134,11 @@ code.secret { background: #0c1119; padding: 2px 6px; border-radius: 4px; }
+   border-radius: 999px;
+   font-size: 0.78rem;
+   font-weight: 600;
++  border: 1px solid transparent;
+ }
+-.badge.ok { background: rgba(47,191,113,0.15); color: var(--ok); }
+-.badge.bad { background: rgba(229,72,77,0.15); color: var(--bad); }
+-.badge.warn { background: rgba(230,168,55,0.15); color: var(--warn); }
++.badge.ok { background: rgba(53,212,136,0.16); color: var(--ok); border-color: rgba(53,212,136,0.4); }
++.badge.bad { background: rgba(255,95,102,0.16); color: var(--bad); border-color: rgba(255,95,102,0.4); }
++.badge.warn { background: rgba(255,182,72,0.16); color: var(--warn); border-color: rgba(255,182,72,0.4); }
+ 
+ .muted { color: var(--muted); font-size: 0.88rem; }
+ 
+@@ -142,10 +151,11 @@ code.secret { background: #0c1119; padding: 2px 6px; border-radius: 4px; }
+   border-radius: 6px;
+   margin-bottom: 8px;
+   font-size: 0.9rem;
++  border: 1px solid transparent;
+ }
+-.flash.success { background: rgba(47,191,113,0.15); color: var(--ok); }
+-.flash.error { background: rgba(229,72,77,0.15); color: var(--bad); }
+-.flash.warn { background: rgba(230,168,55,0.15); color: var(--warn); }
++.flash.success { background: rgba(53,212,136,0.14); color: var(--ok); border-color: rgba(53,212,136,0.35); }
++.flash.error { background: rgba(255,95,102,0.14); color: var(--bad); border-color: rgba(255,95,102,0.35); }
++.flash.warn { background: rgba(255,182,72,0.14); color: var(--warn); border-color: rgba(255,182,72,0.35); }
+ 
+ pre.log {
+   background: #0c1119;
+diff --git a/templates/auth_log.html b/templates/auth_log.html
+index ef50b66..d46ec71 100644
+--- a/templates/auth_log.html
++++ b/templates/auth_log.html
+@@ -11,6 +11,8 @@
+         <option value="60" {{ 'selected' if minutes==60 }}>Last hour</option>
+         <option value="360" {{ 'selected' if minutes==360 }}>Last 6 hours</option>
+         <option value="1440" {{ 'selected' if minutes==1440 }}>Last 24 hours</option>
++        <option value="10080" {{ 'selected' if minutes==10080 }}>Last 7 days</option>
++        <option value="0" {{ 'selected' if minutes==0 }}>All time (in current log)</option>
+       </select>
+     </label>
+     <label class="checkbox" style="margin-bottom:9px">
+@@ -70,7 +72,8 @@
+ 
+ <p class="muted">Source: <code>{{ log_file or 'not detected yet' }}</code>. This is a dedicated log
+   written by a linelog module the GUI installs (see Settings) - not FreeRADIUS's default text log -
+-  so all fields are structured and reliable.</p>
++  so all fields are structured and reliable. "All time" covers everything in the current log file;
++  older entries that have already been rotated out (see logrotate config) aren't included.</p>
+ 
+ <script>
+ function filterTable() {
