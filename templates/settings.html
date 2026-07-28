@@ -28,4 +28,55 @@
   <p class="muted">Service name: {{ service_name }}</p>
   <p class="muted">Auth log file: {{ auth_log_file or 'not detected yet - click Apply on the Dashboard once' }}</p>
 </div>
+
+<div class="card">
+  <h2>Multi-server monitoring</h2>
+  <p class="muted">
+    Lets another FreeRADIUS GUI instance poll <strong>this</strong> server's status (service state,
+    pending changes, cert warnings) for a combined view. This server's own <a href="{{ url_for('servers') }}">Servers</a>
+    page does the same thing for any peers you add below.
+  </p>
+  <p class="muted">To let another instance monitor this one, give it this server's URL and API key:</p>
+  <p>URL: <code class="secret">https://{{ this_hostname }}:{{ bind_port }}</code></p>
+  <p>API key: <code class="secret">{{ api_key }}</code></p>
+  <form method="post" onsubmit="return confirm('Regenerating invalidates the current key immediately - any peer server monitoring this one will show it as unreachable until you update the key there too. Continue?')">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="action" value="regenerate_api_key">
+    <button type="submit" class="link-btn danger">Regenerate API key</button>
+  </form>
+
+  <hr style="border-color: var(--panel-border); margin: 20px 0">
+
+  <h2>Known servers (for the Servers page)</h2>
+  {% if known_servers %}
+    {% for s in known_servers %}
+      <div class="ca-item">
+        <p>{{ s.name }} &middot; <span class="muted">{{ s.url }}</span></p>
+        <form method="post" style="display:inline" onsubmit="return confirm('Remove {{ s.name }} from known servers?')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <input type="hidden" name="action" value="delete_known_server">
+          <input type="hidden" name="index" value="{{ loop.index0 }}">
+          <button type="submit" class="link-btn danger">remove</button>
+        </form>
+      </div>
+    {% endfor %}
+  {% else %}
+    <p class="muted">No other servers added yet.</p>
+  {% endif %}
+
+  <form method="post" class="inline" style="flex-wrap:wrap; align-items:flex-end; margin-top:12px">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="hidden" name="action" value="add_known_server">
+    <label style="flex:1; min-width:140px">Display name
+      <input type="text" name="server_name" placeholder="Branch office RADIUS">
+    </label>
+    <label style="flex:1; min-width:200px">URL (from its Settings page)
+      <input type="text" name="server_url" placeholder="https://radius2.example.com:8443" required>
+    </label>
+    <label style="flex:1; min-width:200px">API key (from its Settings page)
+      <input type="text" name="server_token" required>
+    </label>
+    <button type="submit" class="primary">Add server</button>
+  </form>
+</div>
 {% endblock %}

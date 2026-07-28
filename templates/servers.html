@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Servers - FreeRADIUS GUI{% endblock %}
+{% block content %}
+<h1>Servers</h1>
+
+<div class="card">
+  <h2>This server</h2>
+  <p class="muted">{{ this_hostname }}</p>
+</div>
+
+{% if results %}
+<div class="grid">
+  {% for r in results %}
+  <div class="card">
+    <h2>{{ r.name }}</h2>
+    <p class="muted">{{ r.url }}</p>
+    {% if r.data %}
+      <p>FreeRADIUS:
+        <span class="badge {{ 'ok' if r.data.freeradius_status == 'active' else 'bad' }}">{{ r.data.freeradius_status }}</span>
+        {% if r.data.pending_changes %}<span class="badge warn">unapplied changes</span>{% endif %}
+        {% if r.data.cert_warning %}<span class="badge warn">cert expiring/expired</span>{% endif %}
+      </p>
+      {% if r.data.freeradius_version %}<p class="muted">Version: {{ r.data.freeradius_version }}</p>{% endif %}
+      <p class="muted">{{ r.data.client_count }} client(s) configured</p>
+      {% if r.data.last_apply %}
+        <p class="muted">Last apply: {{ r.data.last_apply.time }}
+          <span class="badge {{ 'ok' if r.data.last_apply.success else 'bad' }}">{{ 'OK' if r.data.last_apply.success else 'FAILED' }}</span>
+        </p>
+      {% endif %}
+    {% else %}
+      <p><span class="badge bad">unreachable</span></p>
+      <p class="muted">{{ r.error }}</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card">
+  <p class="muted">No other servers added yet. Go to <a href="{{ url_for('settings') }}">Settings</a>
+    to add one - you'll need its URL and API key from its own Settings page.</p>
+</div>
+{% endif %}
+{% endblock %}
