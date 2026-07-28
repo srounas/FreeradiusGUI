@@ -27,6 +27,21 @@
           <span class="badge {{ 'ok' if r.data.last_apply.success else 'bad' }}">{{ 'OK' if r.data.last_apply.success else 'FAILED' }}</span>
         </p>
       {% endif %}
+
+      <hr style="border-color: var(--panel-border); margin: 14px 0">
+      <p><strong>Config sync</strong></p>
+      {% if r.config_error %}
+        <p class="muted">Could not compare: {{ r.config_error }}</p>
+      {% elif r.config_diffs %}
+        <p><span class="badge warn">{{ r.config_diffs|length }} difference(s)</span></p>
+        <ul style="margin: 8px 0 0 18px; padding: 0;">
+          {% for d in r.config_diffs %}
+          <li class="muted" style="margin-bottom: 4px;">{{ d }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p><span class="badge ok">in sync</span></p>
+      {% endif %}
     {% else %}
       <p><span class="badge bad">unreachable</span></p>
       <p class="muted">{{ r.error }}</p>
@@ -40,4 +55,12 @@
     to add one - you'll need its URL and API key from its own Settings page.</p>
 </div>
 {% endif %}
+
+<div class="card">
+  <p class="muted">Config sync compares RADIUS clients and trusted CA certs between servers.
+    Shared secrets are never sent over the network - each side sends only a one-way fingerprint
+    of its own secret, and the comparison happens locally after fetching the other side's
+    fingerprints. A difference tells you <em>which</em> client or cert differs, never the
+    secret value itself.</p>
+</div>
 {% endblock %}
