@@ -30,6 +30,7 @@ main {
 
 h1 { font-size: 1.6rem; margin: 8px 0 20px; }
 h2 { font-size: 1.1rem; margin: 0 0 12px; }
+
 a { color: var(--accent); }
 a:visited { color: var(--accent); }
 a:hover { color: var(--accent-hover); }
