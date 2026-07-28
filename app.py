@@ -9,6 +9,7 @@ Runs on the same host as FreeRADIUS. Edits the real config files, validates
 with `freeradius -CX`, and restarts the service.
 """
 import hashlib
+import hmac
 import io
 import ipaddress
 import json
@@ -1042,6 +1043,8 @@ def certs():
             os.chmod(paths["server_cert"], 0o640)
             os.chmod(paths["server_key"], 0o640)
             STATE["last_key_password"] = ""
+            STATE["root_ca_source"] = "local"
+            STATE.pop("root_ca_issuer_name", None)
             _persist_state()
 
             flash(
@@ -1094,6 +1097,79 @@ def certs():
                 "success",
             )
 
+        elif action == "request_cert_from_ca_host":
+            if not HAVE_CRYPTOGRAPHY:
+                flash("The 'cryptography' package is required to generate certificates", "error")
+                return redirect(url_for("certs"))
+            known = STATE.get("known_servers", [])
+            try:
+                idx = int(request.form.get("ca_host_index", -1))
+            except ValueError:
+                idx = -1
+            if not (0 <= idx < len(known)):
+                flash("Select a valid known server to request a certificate from - add one "
+                      "under Settings first if the list is empty.", "error")
+                return redirect(url_for("certs"))
+            peer = known[idx]
+            peer_label = peer.get("name") or peer["url"]
+
+            gen_paths = generated_ca_paths()
+            if gen_paths["key"].exists() and STATE.get("ca_host_enabled"):
+                flash(f"This server is itself set up as a CA host for other servers - switching "
+                      f"to {peer_label}'s root would break trust for anything relying on this "
+                      f"one's root. Disable 'Allow other servers to request certificates from "
+                      f"this one' under Settings first if you really want to do this.", "error")
+                return redirect(url_for("certs"))
+
+            server_cn = request.form.get("server_common_name", "").strip() or socket.gethostname()
+            san_raw = request.form.get("server_san", "").strip()
+            san_entries = [s.strip() for s in san_raw.split(",") if s.strip()]
+            try:
+                validity_years = int(request.form.get("validity_years", "10"))
+            except ValueError:
+                validity_years = -1
+            if not (1 <= validity_years <= 30):
+                flash("Validity period must be a whole number of years between 1 and 30", "error")
+                return redirect(url_for("certs"))
+
+            server_key, csr = _build_csr(server_cn, san_entries)
+            csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode()
+            result, err = _request_csr_signature(peer["url"], peer.get("token", ""), csr_pem, validity_years)
+            if err:
+                flash(f"Could not get a certificate from {peer_label}: {err}", "error")
+                return redirect(url_for("certs"))
+
+            paths["server_cert"].write_text(result["cert_pem"])
+            paths["server_key"].write_text(_key_to_pem(server_key, ""))
+            os.chmod(paths["server_cert"], 0o640)
+            os.chmod(paths["server_key"], 0o640)
+            STATE["last_key_password"] = ""
+
+            # Cache a local copy of the issuer's root cert (public part only -
+            # never its key) so this server can display/download it too, and
+            # so Intune only ever needs the one shared root regardless of
+            # which server in the fleet you got it from.
+            if gen_paths["key"].exists():
+                backup = gen_paths["key"].with_name(
+                    gen_paths["key"].name + f".bak-{int(time.time())}"
+                )
+                gen_paths["key"].rename(backup)
+                flash(f"Note: this server previously had its own root CA key - it was moved to "
+                      f"{backup.name} rather than deleted, in case you need it back.", "warn")
+            gen_paths["cert"].write_text(result["root_cert_pem"])
+            os.chmod(gen_paths["cert"], 0o640)
+            STATE["root_ca_source"] = "remote"
+            STATE["root_ca_issuer_name"] = peer_label
+            _persist_state()
+
+            flash(
+                f"Got a server certificate for {server_cn} signed by {peer_label}'s root CA "
+                f"(common name in request: {result.get('common_name', server_cn)}). Since it's "
+                "the same root as your other servers, Intune only needs the one Trusted "
+                "Certificate. Go to Dashboard and click Apply.",
+                "success",
+            )
+
         return redirect(url_for("certs"))
 
     generated_ca_info = None
@@ -1108,6 +1184,11 @@ def certs():
     return render_template(
         "certs.html", info=info, have_crypto=HAVE_CRYPTOGRAPHY,
         generated_ca=generated_ca_info, default_server_cn=socket.gethostname(),
+        has_root_key=gen_paths["key"].exists(),
+        root_ca_source=STATE.get("root_ca_source"),
+        root_ca_issuer_name=STATE.get("root_ca_issuer_name"),
+        known_servers=STATE.get("known_servers", []),
+        ca_host_enabled=STATE.get("ca_host_enabled", False),
     )
 
 
@@ -1198,14 +1279,35 @@ def auth_log():
     except ValueError:
         minutes = 60
     autorefresh = request.args.get("autorefresh") == "1"
+    combined = request.args.get("combined") == "1" and bool(STATE.get("known_servers"))
     log_file = STATE.get("auth_log_file") or (auth_log_path() if RADIUSD_CONF.exists() else None)
     # "All time" (minutes<=0) needs a much bigger tail buffer, since a wide
     # window on a busy server can span far more than the usual 50k-line default.
     max_lines = 500000 if minutes <= 0 else 50000
     entries, counts, err = parse_auth_log(log_file, minutes, max_lines=max_lines)
+    for e in entries:
+        e["server"] = socket.gethostname()
+
+    peer_errors = []
+    if combined:
+        for s in STATE.get("known_servers", []):
+            peer_entries, perr = _fetch_peer_auth_log(s["url"], s.get("token", ""), minutes)
+            label = s.get("name") or s["url"]
+            if perr:
+                peer_errors.append(f"{label} ({perr})")
+                continue
+            for e in peer_entries:
+                e["server"] = label
+                entries.append(e)
+                key = "accept" if e["outcome"] == "Accept" else "reject"
+                counts[key] = counts.get(key, 0) + 1
+        entries.sort(key=lambda e: e["sort_ts"], reverse=True)
+
     return render_template(
         "auth_log.html", entries=entries, counts=counts, error=err,
         minutes=minutes, autorefresh=autorefresh, log_file=log_file,
+        combined=combined, peer_errors=peer_errors,
+        has_known_servers=bool(STATE.get("known_servers")),
     )
 
 
@@ -1262,6 +1364,16 @@ def settings():
                 _persist_state()
                 flash(f"Removed '{removed.get('name', removed.get('url'))}' from known servers", "success")
 
+        elif action == "set_ca_host_enabled":
+            STATE["ca_host_enabled"] = request.form.get("ca_host_enabled") == "1"
+            _persist_state()
+            flash(
+                "Other servers can now request certificates signed by this server's root CA."
+                if STATE["ca_host_enabled"] else
+                "This server will no longer sign certificate requests from other servers.",
+                "success",
+            )
+
         return redirect(url_for("settings"))
     return render_template(
         "settings.html",
@@ -1272,18 +1384,22 @@ def settings():
         known_servers=STATE.get("known_servers", []),
         this_hostname=socket.gethostname(),
         bind_port=STATE.get("bind_port", 8443),
+        ca_host_enabled=STATE.get("ca_host_enabled", False),
+        has_root_key=generated_ca_paths()["key"].exists(),
     )
 
 
-def _fetch_peer_status(url, token, timeout=5):
-    """Poll another FreeRADIUS GUI instance's /api/status. These servers use
+def _peer_request(url, token, path, method="GET", body=None, timeout=5):
+    """Shared HTTP helper for talking to another FreeRADIUS GUI instance's
+    API (status, config-summary, auth-log, CSR signing). These peers use
     self-signed GUI certs by default (same as this one), so we don't verify
     the peer's TLS chain here - this is meant for a private admin network,
     not the open internet. Returns (data_dict_or_None, error_str_or_None)."""
-    req = urllib.request.Request(
-        url.rstrip("/") + "/api/status",
-        headers={"Authorization": f"Bearer {token}"},
-    )
+    data_bytes = json.dumps(body).encode() if body is not None else None
+    headers = {"Authorization": f"Bearer {token}"}
+    if data_bytes is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url.rstrip("/") + path, data=data_bytes, headers=headers, method=method)
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -1293,11 +1409,197 @@ def _fetch_peer_status(url, token, timeout=5):
     except urllib.error.HTTPError as e:
         if e.code == 401:
             return None, "rejected (401) - check the API key matches on both sides"
-        return None, f"HTTP {e.code}"
+        try:
+            payload = json.loads(e.read().decode())
+            return None, payload.get("error", f"HTTP {e.code}")
+        except Exception:  # noqa: BLE001
+            return None, f"HTTP {e.code}"
     except urllib.error.URLError as e:
         return None, f"unreachable ({e.reason})"
     except (TimeoutError, ValueError, json.JSONDecodeError) as e:
         return None, str(e)
+
+
+def _fetch_peer_status(url, token, timeout=5):
+    return _peer_request(url, token, "/api/status", timeout=timeout)
+
+
+def _fetch_peer_config_summary(url, token, timeout=5):
+    return _peer_request(url, token, "/api/config-summary", timeout=timeout)
+
+
+def _fetch_peer_auth_log(url, token, minutes, timeout=8):
+    data, err = _peer_request(url, token, f"/api/auth-log?range={minutes}", timeout=timeout)
+    if err:
+        return [], err
+    return data.get("entries", []), None
+
+
+def _request_csr_signature(url, token, csr_pem, validity_years, timeout=10):
+    return _peer_request(
+        url, token, "/api/sign-csr", method="POST",
+        body={"csr_pem": csr_pem, "validity_years": validity_years},
+        timeout=timeout,
+    )
+
+
+def build_config_summary(hmac_key: bytes):
+    """A locally-computed, comparison-only snapshot of this server's config.
+    Deliberately excludes anything that would let a peer reconstruct secrets:
+    client shared secrets are reduced to an HMAC-SHA256 fingerprint keyed by
+    the pairwise API token both sides already share (not a plain hash - RADIUS
+    secrets are often short/guessable, and a bare SHA-256 of one would let
+    anyone who saw it offline-crack the value; keying it means only someone
+    who already holds that same API key can verify a guess). Certificates are
+    represented by their public fingerprint, which isn't sensitive to begin
+    with, so those need no keying."""
+    paths = eap_tls_paths()
+    client_summaries = []
+    for c in load_clients():
+        secret = c.get("secret", "")
+        client_summaries.append({
+            "name": c.get("name", ""),
+            "ipaddr": c.get("ipaddr", ""),
+            "secret_sha256": hmac.new(hmac_key, secret.encode(), hashlib.sha256).hexdigest() if secret else None,
+        })
+
+    def _fp(path):
+        if not path.exists():
+            return None
+        try:
+            return _cert_fingerprint(_load_all_certs(path.read_bytes())[0])
+        except CertError:
+            return None
+
+    ca_fps = []
+    if paths["ca_bundle"].exists():
+        try:
+            ca_fps = sorted(_cert_fingerprint(c) for c in _load_all_certs(paths["ca_bundle"].read_bytes()))
+        except CertError:
+            ca_fps = []
+
+    return {
+        "clients": sorted(client_summaries, key=lambda c: c["name"]),
+        "server_cert_fingerprint": _fp(paths["server_cert"]),
+        "ca_bundle_fingerprints": ca_fps,
+        "root_ca_fingerprint": _fp(generated_ca_paths()["cert"]),
+        "freeradius_version": freeradius_version(),
+    }
+
+
+def diff_config_summaries(local, remote):
+    """Compare two config summaries built by build_config_summary() and
+    return a list of plain-English differences - naming what's different
+    (which client, which cert) without ever including secret values, since
+    only fingerprints/hashes were exchanged in the first place."""
+    diffs = []
+
+    local_by_name = {c["name"]: c for c in local.get("clients", [])}
+    remote_by_name = {c["name"]: c for c in remote.get("clients", [])}
+    for name in sorted(set(local_by_name) | set(remote_by_name)):
+        lc, rc = local_by_name.get(name), remote_by_name.get(name)
+        if lc and not rc:
+            diffs.append(f"Client '{name}' exists on this server but not on the other")
+        elif rc and not lc:
+            diffs.append(f"Client '{name}' exists on the other server but not on this one")
+        elif lc["ipaddr"] != rc["ipaddr"]:
+            diffs.append(f"Client '{name}' has a different IP/network on each server")
+        elif lc["secret_sha256"] != rc["secret_sha256"]:
+            diffs.append(f"Client '{name}' has a different shared secret on each server")
+
+    if local.get("server_cert_fingerprint") != remote.get("server_cert_fingerprint"):
+        diffs.append("Server certificates differ (expected if each has its own leaf cert - "
+                      "only a concern if you intended them to match)")
+
+    local_ca = set(local.get("ca_bundle_fingerprints", []))
+    remote_ca = set(remote.get("ca_bundle_fingerprints", []))
+    if local_ca != remote_ca:
+        only_local = len(local_ca - remote_ca)
+        only_remote = len(remote_ca - local_ca)
+        parts = []
+        if only_local:
+            parts.append(f"{only_local} trusted CA cert(s) only on this server")
+        if only_remote:
+            parts.append(f"{only_remote} trusted CA cert(s) only on the other")
+        diffs.append("Trusted CA bundle differs: " + ", ".join(parts))
+
+    if local.get("root_ca_fingerprint") != remote.get("root_ca_fingerprint"):
+        if local.get("root_ca_fingerprint") and remote.get("root_ca_fingerprint"):
+            diffs.append("Self-signed root CA differs between servers (expected unless you "
+                          "deliberately shared one root via 'Request certificate from CA host')")
+        elif local.get("root_ca_fingerprint") or remote.get("root_ca_fingerprint"):
+            diffs.append("Only one of the two servers has a GUI-generated root CA on file")
+
+    if local.get("freeradius_version") != remote.get("freeradius_version"):
+        diffs.append(f"FreeRADIUS version differs: {local.get('freeradius_version')} vs "
+                      f"{remote.get('freeradius_version')}")
+
+    return diffs
+
+
+def _build_csr(common_name: str, san_entries):
+    """Generate a fresh private key + CSR locally. The key never leaves this
+    server; only the CSR (a public-key request, not sensitive) is sent to a
+    CA host for signing."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    san_list = [x509.DNSName(common_name)]
+    for entry in san_entries:
+        try:
+            san_list.append(x509.IPAddress(ipaddress.ip_address(entry)))
+        except ValueError:
+            san_list.append(x509.DNSName(entry))
+    csr = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(name)
+        .add_extension(x509.SubjectAlternativeName(san_list), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    return key, csr
+
+
+def _sign_csr(ca_key, ca_cert, csr, validity_years: int):
+    """Sign a peer's CSR with this server's local root CA. Only ever called
+    on the CA host, which is the only place the root's private key exists."""
+    if not csr.is_signature_valid:
+        raise CertError("CSR signature is invalid")
+    now = datetime.now(timezone.utc)
+    ca_not_after = getattr(ca_cert, "not_valid_after_utc", None) or ca_cert.not_valid_after
+    if ca_not_after.tzinfo is None:
+        ca_not_after = ca_not_after.replace(tzinfo=timezone.utc)
+    not_after = min(now + timedelta(days=365 * validity_years), ca_not_after)
+
+    try:
+        san_list = list(csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value)
+    except x509.ExtensionNotFound:
+        san_list = []
+    cn_attrs = csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    cn = cn_attrs[0].value if cn_attrs else "unknown"
+    if not any(isinstance(n, x509.DNSName) and n.value == cn for n in san_list):
+        san_list.append(x509.DNSName(cn))
+
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(csr.subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(csr.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(not_after)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True, key_encipherment=True, content_commitment=False,
+                data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                crl_sign=False, encipher_only=False, decipher_only=False,
+            ), critical=True,
+        )
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(x509.SubjectAlternativeName(san_list), critical=False)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    return cert, cn
 
 
 @app.route("/api/status")
@@ -1320,6 +1622,67 @@ def api_status():
     })
 
 
+@app.route("/api/config-summary")
+@api_key_required
+def api_config_summary():
+    """Comparison-only config snapshot - see build_config_summary() for what
+    is and isn't included. Used by a peer's Servers page to check config
+    drift without either side ever sending the other its actual secrets."""
+    return jsonify(build_config_summary(STATE.get("api_key", "").encode()))
+
+
+@app.route("/api/auth-log")
+@api_key_required
+def api_auth_log():
+    try:
+        minutes = int(request.args.get("range", "60"))
+    except ValueError:
+        minutes = 60
+    log_file = STATE.get("auth_log_file") or (auth_log_path() if RADIUSD_CONF.exists() else None)
+    max_lines = 500000 if minutes <= 0 else 50000
+    entries, _counts, err = parse_auth_log(log_file, minutes, max_lines=max_lines)
+    # Cap the payload - this is meant for a quick combined view, not bulk export.
+    return jsonify({"entries": entries[:1000], "server_name": socket.gethostname(), "error": err})
+
+
+@app.route("/api/sign-csr", methods=["POST"])
+@api_key_required
+def api_sign_csr():
+    """Lets a satellite server request a certificate signed by this server's
+    local root CA, so a fleet of servers can share one root and Intune only
+    needs one Trusted Certificate profile. The root's private key never
+    leaves this server - only the (public) CSR comes in and the (public)
+    signed cert + root cert go out."""
+    if not HAVE_CRYPTOGRAPHY:
+        return jsonify({"error": "The 'cryptography' package is not available on this server"}), 500
+    if not STATE.get("ca_host_enabled"):
+        return jsonify({"error": "This server is not configured to sign requests from other "
+                                  "servers (enable it under Settings first)"}), 403
+    ca_key, ca_cert = load_generated_ca()
+    if ca_key is None:
+        return jsonify({"error": "No root CA is present on this server yet - generate one on "
+                                  "the Certificates page first"}), 400
+
+    body = request.get_json(silent=True) or {}
+    try:
+        validity_years = int(body.get("validity_years", 10))
+    except (TypeError, ValueError):
+        validity_years = 10
+    validity_years = max(1, min(30, validity_years))
+
+    try:
+        csr = x509.load_pem_x509_csr(body.get("csr_pem", "").encode())
+        cert, cn = _sign_csr(ca_key, ca_cert, csr, validity_years)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"Could not sign CSR: {e}"}), 400
+
+    return jsonify({
+        "cert_pem": _cert_to_pem(cert),
+        "root_cert_pem": _cert_to_pem(ca_cert),
+        "common_name": cn,
+    })
+
+
 @app.route("/servers")
 @login_required
 def servers():
@@ -1327,7 +1690,22 @@ def servers():
     results = []
     for s in known:
         data, err = _fetch_peer_status(s["url"], s.get("token", ""))
-        results.append({"name": s.get("name") or s["url"], "url": s["url"], "data": data, "error": err})
+        config_diffs = None
+        config_error = None
+        if not err:
+            remote_summary, cfg_err = _fetch_peer_config_summary(s["url"], s.get("token", ""))
+            if cfg_err:
+                config_error = cfg_err
+            else:
+                # Keyed with THIS peer's token, since that's the key the peer
+                # used to fingerprint its own secrets - has to match per-peer,
+                # not computed once for all of them.
+                local_summary = build_config_summary(s.get("token", "").encode())
+                config_diffs = diff_config_summaries(local_summary, remote_summary)
+        results.append({
+            "name": s.get("name") or s["url"], "url": s["url"], "data": data, "error": err,
+            "config_diffs": config_diffs, "config_error": config_error,
+        })
     return render_template("servers.html", results=results, this_hostname=socket.gethostname())
 
 

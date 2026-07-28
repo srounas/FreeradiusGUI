@@ -548,6 +548,35 @@ to see health at a glance. It's intended for a private admin network; peer conne
 self-signed GUI certificates as the browser UI and aren't certificate-pinned, so keep this traffic
 off the open internet the same way you would the GUI itself.
 
+### Config drift detection
+
+The Servers page also compares each peer's RADIUS client list and certificates against your own and
+tells you if they've drifted apart - useful if you're meant to be running an identical client list
+across a fleet, or sharing one root CA. It will flag:
+
+- A client that exists on one server but not the other.
+- A client with a different IP/network on each side.
+- A client whose shared secret differs between the two.
+- Trusted CA bundle or server/root certificate differences.
+
+**No shared secret is ever sent over the network to make this comparison.** Each server reduces its
+own client secrets to an HMAC-SHA256 fingerprint keyed by the same API key both sides already use to
+authenticate to each other - not a bare hash, since a RADIUS secret is often short enough to be
+guessable, and a bare SHA-256 of it would let anyone who saw that fingerprint offline-crack the
+value. Keying it with the shared API key means only someone who already holds that same key could
+verify a guess. Only the resulting fingerprints (and public certificate metadata, which was never
+sensitive) cross the network; the comparison and the plain-English diff are computed locally on the
+polling server after fetching the peer's fingerprints.
+
+### Combined log viewing
+
+The Auth Log page has a **"Combine with known servers"** checkbox (shown once you have at least one
+server added) that pulls each peer's recent auth events over the same API and merges them into one
+timeline with yours, sorted by time, with a **Server** column showing which server each line came
+from. Peers that are unreachable are listed under the table instead of silently dropping their
+entries. This is meant for a quick combined view, not bulk export - each poll is capped at 1000
+entries per peer.
+
 ---
 
 ## Security notes
