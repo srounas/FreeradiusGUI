@@ -505,6 +505,51 @@ This helps prevent invalid certificate material from being written to disk and b
 
 ---
 
+## Generating a self-signed server certificate
+
+If you don't have an existing PKI to issue the RADIUS server's certificate from, the Certificates
+page can generate one for you (Option D):
+
+- It creates a private **root CA** (kept on this server, never distributed) and a **server
+  certificate signed by it**, with a validity period you choose (1-30 years).
+- Download the root CA's public certificate (`.cer` for Intune, or `.pem`) and deploy it to your
+  devices - e.g. as an Intune **Trusted Certificate** profile - so they trust this server during
+  EAP-TLS. The root's private key never leaves the server.
+- When it's time to renew, use **"Renew server cert (same root CA)"** instead of generating a new
+  root - this reuses the existing root, so devices that already trust it don't need anything
+  re-pushed; only the server's own certificate changes.
+- Generating a brand new root CA replaces the old one and invalidates trust on any device that
+  hasn't received the new root yet - only do this if you're prepared to redeploy it.
+
+This root CA is separate from the trusted CA bundle above it on the same page - that one validates
+*client* certificates during EAP-TLS; this one only signs the *server's own* certificate.
+
+---
+
+## Multi-server monitoring
+
+If you run FreeRADIUS GUI on more than one server, the **Servers** page gives you an at-a-glance
+combined view: FreeRADIUS service state, unapplied changes, certificate warnings, and client count
+for each one.
+
+To set it up:
+
+1. On server A, go to **Settings** and copy its URL and API key.
+2. On server B, go to **Settings → Known servers** and add server A using that URL and key.
+3. Server B's **Servers** page will now poll server A's status.
+
+This is one-directional per entry - add each server to every other server's Known servers list if
+you want everyone monitoring everyone. Each server's API key can be regenerated independently from
+Settings if you suspect it's been exposed; you'll need to update it on any peer monitoring that
+server afterward.
+
+The status endpoint doesn't expose secrets (no client list, no certificate contents) - just enough
+to see health at a glance. It's intended for a private admin network; peer connections use the same
+self-signed GUI certificates as the browser UI and aren't certificate-pinned, so keep this traffic
+off the open internet the same way you would the GUI itself.
+
+---
+
 ## Security notes
 
 This tool handles sensitive RADIUS configuration, including:

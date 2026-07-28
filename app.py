@@ -16,22 +16,27 @@ import os
 import re
 import secrets
 import socket
+import ssl
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import zipfile
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 
-from flask import (Flask, abort, flash, redirect, render_template, request,
-                    send_file, session, url_for)
+from flask import (Flask, abort, flash, jsonify, redirect, render_template,
+                    request, send_file, session, url_for)
 from werkzeug.security import check_password_hash, generate_password_hash
 
 try:
     from cryptography import x509
-    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
     from cryptography.hazmat.primitives.serialization import pkcs12
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
     HAVE_CRYPTOGRAPHY = True
 except ImportError:
     HAVE_CRYPTOGRAPHY = False
@@ -94,6 +99,10 @@ app.config["SESSION_COOKIE_SECURE"] = GUI_TLS_ENABLED
 # login-attempt lockout entirely.
 TRUST_PROXY_HEADERS = bool(STATE.get("trust_proxy_headers", False))
 
+if not STATE.get("api_key"):
+    STATE["api_key"] = secrets.token_hex(24)
+    _persist_state()
+
 
 @app.after_request
 def set_security_headers(resp):
@@ -143,6 +152,20 @@ def login_required(fn):
     def wrapper(*a, **kw):
         if not session.get("authed"):
             return redirect(url_for("login"))
+        return fn(*a, **kw)
+    return wrapper
+
+
+def api_key_required(fn):
+    """Guards machine-to-machine endpoints (used by the multi-server view on
+    other GUI instances) with a bearer token instead of the admin session -
+    these are polled by other servers, not by a logged-in browser."""
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else ""
+        if not token or not STATE.get("api_key") or not secrets.compare_digest(token, STATE["api_key"]):
+            abort(401)
         return fn(*a, **kw)
     return wrapper
 
@@ -441,6 +464,88 @@ def existing_ca_pems(ca_bundle_path):
         return []
 
 
+def _build_ca_cert(ca_cn: str, validity_years: int):
+    """Generate a fresh self-signed root CA key + certificate."""
+    now = datetime.now(timezone.utc)
+    not_after = now + timedelta(days=365 * validity_years)
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, ca_cn)])
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(not_after)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True, key_cert_sign=True, crl_sign=True,
+                key_encipherment=False, content_commitment=False,
+                data_encipherment=False, key_agreement=False,
+                encipher_only=False, decipher_only=False,
+            ), critical=True,
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    return ca_key, ca_cert
+
+
+def _build_server_cert(ca_key, ca_cert, server_cn: str, san_entries, validity_years: int):
+    """Generate a server leaf key + certificate signed by the given CA.
+    Clamps validity so the leaf never outlives its issuing root."""
+    now = datetime.now(timezone.utc)
+    ca_not_after = getattr(ca_cert, "not_valid_after_utc", None) or ca_cert.not_valid_after
+    if ca_not_after.tzinfo is None:
+        ca_not_after = ca_not_after.replace(tzinfo=timezone.utc)
+    not_after = min(now + timedelta(days=365 * validity_years), ca_not_after)
+
+    server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    server_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, server_cn)])
+    san_list = [x509.DNSName(server_cn)]
+    for entry in san_entries:
+        try:
+            san_list.append(x509.IPAddress(ipaddress.ip_address(entry)))
+        except ValueError:
+            san_list.append(x509.DNSName(entry))
+
+    server_cert = (
+        x509.CertificateBuilder()
+        .subject_name(server_name)
+        .issuer_name(ca_cert.subject)
+        .public_key(server_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(not_after)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True, key_encipherment=True,
+                content_commitment=False, data_encipherment=False,
+                key_agreement=False, key_cert_sign=False, crl_sign=False,
+                encipher_only=False, decipher_only=False,
+            ), critical=True,
+        )
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+        .add_extension(x509.SubjectAlternativeName(san_list), critical=False)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
+        .sign(ca_key, hashes.SHA256())
+    )
+    return server_key, server_cert
+
+
+def load_generated_ca():
+    """Load the stored generated-root CA key+cert, if one exists on disk."""
+    paths = generated_ca_paths()
+    if not (paths["key"].exists() and paths["cert"].exists()):
+        return None, None
+    ca_key = serialization.load_pem_private_key(paths["key"].read_bytes(), password=None)
+    ca_cert = _load_all_certs(paths["cert"].read_bytes())[0]
+    return ca_key, ca_cert
+
+
 def cert_display_info(cert):
     not_after = getattr(cert, "not_valid_after_utc", None) or cert.not_valid_after
     if not_after.tzinfo is None:
@@ -484,6 +589,18 @@ def eap_tls_paths():
         "server_cert": CERTS_DIR / "server.pem",
         "server_key": CERTS_DIR / "server.key",
         "ca_bundle": CERTS_DIR / "ca.pem",
+    }
+
+
+def generated_ca_paths():
+    """Dedicated files for a GUI-generated self-signed root CA. Kept separate
+    from the trusted CA bundle (which validates *client* certs) because this
+    root exists to sign the *server's own* certificate - a different trust
+    role. Keeping the key means a later server-cert renewal can reuse the
+    same root without re-distributing a new one to every device."""
+    return {
+        "key": CERTS_DIR / "generated-ca-root.key",
+        "cert": CERTS_DIR / "generated-ca-root.pem",
     }
 
 
@@ -894,13 +1011,121 @@ def certs():
                 except CertError as e:
                     flash(f"Could not update CA bundle: {e}", "error")
 
+        elif action == "generate_selfsigned":
+            if not HAVE_CRYPTOGRAPHY:
+                flash("The 'cryptography' package is required to generate certificates", "error")
+                return redirect(url_for("certs"))
+
+            ca_cn = request.form.get("ca_common_name", "").strip() or f"{socket.gethostname()} Root CA"
+            server_cn = request.form.get("server_common_name", "").strip() or socket.gethostname()
+            san_raw = request.form.get("server_san", "").strip()
+            san_entries = [s.strip() for s in san_raw.split(",") if s.strip()]
+            try:
+                validity_years = int(request.form.get("validity_years", "10"))
+            except ValueError:
+                validity_years = -1
+            if not (1 <= validity_years <= 30):
+                flash("Validity period must be a whole number of years between 1 and 30", "error")
+                return redirect(url_for("certs"))
+
+            ca_key, ca_cert = _build_ca_cert(ca_cn, validity_years)
+            server_key, server_cert = _build_server_cert(ca_key, ca_cert, server_cn, san_entries, validity_years)
+
+            gen_paths = generated_ca_paths()
+            gen_paths["key"].write_text(_key_to_pem(ca_key, ""))
+            gen_paths["cert"].write_text(_cert_to_pem(ca_cert))
+            os.chmod(gen_paths["key"], 0o600)
+            os.chmod(gen_paths["cert"], 0o640)
+
+            paths["server_cert"].write_text(_cert_to_pem(server_cert))
+            paths["server_key"].write_text(_key_to_pem(server_key, ""))
+            os.chmod(paths["server_cert"], 0o640)
+            os.chmod(paths["server_key"], 0o640)
+            STATE["last_key_password"] = ""
+            _persist_state()
+
+            flash(
+                f"Generated a new self-signed root CA ({ca_cn}) and server certificate ({server_cn}), "
+                f"valid {validity_years} year(s). This REPLACED the previous server certificate/key. "
+                "This root is separate from the trusted CA bundle above (that one validates client "
+                "certificates - this one just signs the server's own certificate). Download the root "
+                "below and deploy it to devices, e.g. via an Intune Trusted Certificate profile, so "
+                "they trust this server during EAP-TLS. Go to Dashboard and click Apply.",
+                "success",
+            )
+
+        elif action == "renew_selfsigned_server":
+            if not HAVE_CRYPTOGRAPHY:
+                flash("The 'cryptography' package is required to generate certificates", "error")
+                return redirect(url_for("certs"))
+            ca_key, ca_cert = load_generated_ca()
+            if ca_key is None:
+                flash("No GUI-generated root CA found yet - use 'Generate new self-signed "
+                      "certificate' first.", "error")
+                return redirect(url_for("certs"))
+
+            server_cn = request.form.get("server_common_name", "").strip() or socket.gethostname()
+            san_raw = request.form.get("server_san", "").strip()
+            san_entries = [s.strip() for s in san_raw.split(",") if s.strip()]
+            try:
+                validity_years = int(request.form.get("validity_years", "10"))
+            except ValueError:
+                validity_years = -1
+            if not (1 <= validity_years <= 30):
+                flash("Validity period must be a whole number of years between 1 and 30", "error")
+                return redirect(url_for("certs"))
+
+            server_key, server_cert = _build_server_cert(ca_key, ca_cert, server_cn, san_entries, validity_years)
+            paths["server_cert"].write_text(_cert_to_pem(server_cert))
+            paths["server_key"].write_text(_key_to_pem(server_key, ""))
+            os.chmod(paths["server_cert"], 0o640)
+            os.chmod(paths["server_key"], 0o640)
+            STATE["last_key_password"] = ""
+            _persist_state()
+
+            info = cert_display_info(server_cert)
+            note = ""
+            if info["days_left"] < validity_years * 365 - 30:
+                note = " (clamped to the root CA's own expiry, which is sooner than requested)"
+            flash(
+                f"Renewed server certificate ({server_cn}) using the existing root CA{note}. "
+                "Devices that already trust the root don't need anything re-pushed. "
+                "Go to Dashboard and click Apply.",
+                "success",
+            )
+
         return redirect(url_for("certs"))
+
+    generated_ca_info = None
+    gen_paths = generated_ca_paths()
+    if HAVE_CRYPTOGRAPHY and gen_paths["cert"].exists():
+        generated_ca_info = cert_info(gen_paths["cert"])
 
     info = {
         "server_cert": cert_info(paths["server_cert"]),
         "ca_bundle": certs_info_list(paths["ca_bundle"]),
     }
-    return render_template("certs.html", info=info)
+    return render_template(
+        "certs.html", info=info, have_crypto=HAVE_CRYPTOGRAPHY,
+        generated_ca=generated_ca_info, default_server_cn=socket.gethostname(),
+    )
+
+
+@app.route("/certs/generated_ca/download")
+@login_required
+def download_generated_ca():
+    gen_paths = generated_ca_paths()
+    if not gen_paths["cert"].exists():
+        abort(404)
+    fmt = request.args.get("fmt", "pem")
+    cert = _load_all_certs(gen_paths["cert"].read_bytes())[0]
+    if fmt == "der":
+        data = cert.public_bytes(serialization.Encoding.DER)
+        return send_file(io.BytesIO(data), mimetype="application/pkix-cert",
+                          as_attachment=True, download_name="freeradius-gui-root-ca.cer")
+    data = gen_paths["cert"].read_bytes()
+    return send_file(io.BytesIO(data), mimetype="application/x-pem-file",
+                      as_attachment=True, download_name="freeradius-gui-root-ca.pem")
 
 
 @app.route("/clients", methods=["GET", "POST"])
@@ -1003,13 +1228,107 @@ def settings():
                 STATE["admin_pass_hash"] = generate_password_hash(new)
                 _persist_state()
                 flash("Password changed successfully", "success")
+
+        elif action == "regenerate_api_key":
+            STATE["api_key"] = secrets.token_hex(24)
+            _persist_state()
+            flash("API key regenerated. Update it on any other FreeRADIUS GUI server that "
+                  "monitors this one under Known servers, or its multi-server view will show "
+                  "this server as unreachable.", "success")
+
+        elif action == "add_known_server":
+            name = request.form.get("server_name", "").strip()
+            url = request.form.get("server_url", "").strip().rstrip("/")
+            token = request.form.get("server_token", "").strip()
+            if not url or not token:
+                flash("Server URL and API key are both required", "error")
+            elif not url.startswith("https://"):
+                flash("Server URL must start with https://", "error")
+            else:
+                STATE.setdefault("known_servers", []).append(
+                    {"name": name or url, "url": url, "token": token}
+                )
+                _persist_state()
+                flash(f"Added '{name or url}' to known servers", "success")
+
+        elif action == "delete_known_server":
+            try:
+                idx = int(request.form.get("index", -1))
+            except ValueError:
+                idx = -1
+            known = STATE.get("known_servers", [])
+            if 0 <= idx < len(known):
+                removed = known.pop(idx)
+                _persist_state()
+                flash(f"Removed '{removed.get('name', removed.get('url'))}' from known servers", "success")
+
         return redirect(url_for("settings"))
     return render_template(
         "settings.html",
         raddb=str(RADDB), service_name=SERVICE_NAME,
         admin_user=STATE["admin_user"],
         auth_log_file=STATE.get("auth_log_file") or auth_log_path(),
+        api_key=STATE.get("api_key", ""),
+        known_servers=STATE.get("known_servers", []),
+        this_hostname=socket.gethostname(),
+        bind_port=STATE.get("bind_port", 8443),
     )
+
+
+def _fetch_peer_status(url, token, timeout=5):
+    """Poll another FreeRADIUS GUI instance's /api/status. These servers use
+    self-signed GUI certs by default (same as this one), so we don't verify
+    the peer's TLS chain here - this is meant for a private admin network,
+    not the open internet. Returns (data_dict_or_None, error_str_or_None)."""
+    req = urllib.request.Request(
+        url.rstrip("/") + "/api/status",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            return json.loads(resp.read().decode()), None
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return None, "rejected (401) - check the API key matches on both sides"
+        return None, f"HTTP {e.code}"
+    except urllib.error.URLError as e:
+        return None, f"unreachable ({e.reason})"
+    except (TimeoutError, ValueError, json.JSONDecodeError) as e:
+        return None, str(e)
+
+
+@app.route("/api/status")
+@api_key_required
+def api_status():
+    """Machine-readable status for the multi-server view on other GUI
+    instances. Deliberately excludes anything secret (no secrets, keys, or
+    client lists) - just enough to show at-a-glance health."""
+    paths = eap_tls_paths()
+    server_cert = cert_info(paths["server_cert"])
+    ca_bundle = certs_info_list(paths["ca_bundle"])
+    return jsonify({
+        "name": socket.gethostname(),
+        "freeradius_status": service_status(),
+        "freeradius_version": freeradius_version(),
+        "client_count": len(load_clients()),
+        "pending_changes": compute_pending_hash() != STATE.get("last_applied_hash"),
+        "cert_warning": any_cert_warning({"server_cert": server_cert, "ca_bundle": ca_bundle}),
+        "last_apply": STATE.get("last_apply"),
+    })
+
+
+@app.route("/servers")
+@login_required
+def servers():
+    known = STATE.get("known_servers", [])
+    results = []
+    for s in known:
+        data, err = _fetch_peer_status(s["url"], s.get("token", ""))
+        results.append({"name": s.get("name") or s["url"], "url": s["url"], "data": data, "error": err})
+    return render_template("servers.html", results=results, this_hostname=socket.gethostname())
 
 
 EXPORT_README = (
