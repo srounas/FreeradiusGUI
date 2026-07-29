@@ -2,7 +2,9 @@
 
 A small vibecoded, self-contained web UI for configuring **FreeRADIUS 3.x** for **EAP-TLS certificate-based Wi-Fi authentication**.
 
-<img width="1006" height="1344" alt="image" src="https://github.com/user-attachments/assets/4121148e-49fc-485b-aa09-2559112cb9dd" />
+
+<img width="1012" height="1346" alt="image" src="https://github.com/user-attachments/assets/cfa98a0c-b45a-45f3-b9d4-d6d2964fb83e" />
+
 
 ---
 
