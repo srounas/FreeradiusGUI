@@ -524,6 +524,24 @@ page can generate one for you (Option D):
 This root CA is separate from the trusted CA bundle above it on the same page - that one validates
 *client* certificates during EAP-TLS; this one only signs the *server's own* certificate.
 
+**Removing it:** the "Remove root CA" button clears the GUI-generated root. If the currently active
+server certificate was issued by it, that gets removed too (they're a pair); if you've since
+uploaded a different certificate on top, that upload is left alone. A snapshot is taken first, so
+this is always reversible from the Changelog page.
+
+---
+
+## Changelog and reverting changes
+
+Every time a client or certificate is added, edited, deleted, generated, renewed, or removed, the
+GUI automatically snapshots the *previous* state (clients + certificates only - not host-level
+settings like the admin password or bind address) before making the change. The **Changelog** page
+lists the last 20 of these with a one-click **revert to this** action.
+
+Reverting only restores files on disk here - it doesn't touch the running FreeRADIUS service, so go
+to the **Dashboard** and click **Apply** afterward to actually activate the restored configuration.
+Reverting is itself snapshotted first, so undoing an unwanted revert works the same way.
+
 ---
 
 ## Multi-server monitoring
@@ -568,14 +586,11 @@ verify a guess. Only the resulting fingerprints (and public certificate metadata
 sensitive) cross the network; the comparison and the plain-English diff are computed locally on the
 polling server after fetching the peer's fingerprints.
 
-### Combined log viewing
+### Last authentication timestamp
 
-The Auth Log page has a **"Combine with known servers"** checkbox (shown once you have at least one
-server added) that pulls each peer's recent auth events over the same API and merges them into one
-timeline with yours, sorted by time, with a **Server** column showing which server each line came
-from. Peers that are unreachable are listed under the table instead of silently dropping their
-entries. This is meant for a quick combined view, not bulk export - each poll is capped at 1000
-entries per peer.
+Each server's card on the Servers page also shows its own most recent authentication event (time,
+accept/reject, username) - a quick way to tell if a server is actually seeing traffic without
+opening its Auth Log separately.
 
 ---
 

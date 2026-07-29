@@ -8,6 +8,7 @@ viewer, and a system status/health view.
 Runs on the same host as FreeRADIUS. Edits the real config files, validates
 with `freeradius -CX`, and restarts the service.
 """
+import base64
 import hashlib
 import hmac
 import io
@@ -28,6 +29,8 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 
+from markupsafe import escape
+
 from flask import (Flask, abort, flash, jsonify, redirect, render_template,
                     request, send_file, session, url_for)
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -46,6 +49,8 @@ APP_DIR = Path(__file__).resolve().parent
 STATE_DIR = Path(os.environ.get("FRGUI_STATE_DIR", "/etc/freeradius-gui"))
 CONFIG_FILE = STATE_DIR / "config.json"
 CLIENTS_FILE = STATE_DIR / "clients.json"
+HISTORY_DIR = STATE_DIR / "history"
+MAX_HISTORY_SNAPSHOTS = 20
 
 SESSION_LIFETIME_MINUTES = 30
 MAX_LOGIN_ATTEMPTS = 5
@@ -110,7 +115,11 @@ def set_security_headers(resp):
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
     resp.headers["Referrer-Policy"] = "same-origin"
-    resp.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data:"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data:; "
+        "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "object-src 'none'; base-uri 'self'"
+    )
     if GUI_TLS_ENABLED:
         resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return resp
@@ -142,6 +151,105 @@ def save_clients(clients):
     with open(CLIENTS_FILE, "w") as f:
         json.dump(clients, f, indent=2)
     os.chmod(CLIENTS_FILE, 0o600)
+
+
+# --------------------------------------------------------------------------
+# Configuration history (automatic snapshots + revert)
+# --------------------------------------------------------------------------
+# Captures the GUI-managed RADIUS clients and certificates - never host-level
+# settings like the admin password or bind address, which aren't part of
+# what "revert" is meant to undo. Stored under the same locked-down state
+# directory as everything else here (config.json, clients.json), so the same
+# file permissions model applies.
+
+def _snapshot_paths():
+    if not HISTORY_DIR.exists():
+        return []
+    return sorted(HISTORY_DIR.glob("snap-*.json"), reverse=True)
+
+
+def save_config_snapshot(label):
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    paths = eap_tls_paths()
+    gen_paths = generated_ca_paths()
+
+    def _b64(p):
+        try:
+            return base64.b64encode(p.read_bytes()).decode() if p.exists() else None
+        except OSError:
+            return None
+
+    snapshot = {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "label": label,
+        "clients": load_clients(),
+        "server_cert": _b64(paths["server_cert"]),
+        "server_key": _b64(paths["server_key"]),
+        "ca_bundle": _b64(paths["ca_bundle"]),
+        "generated_ca_cert": _b64(gen_paths["cert"]),
+        "generated_ca_key": _b64(gen_paths["key"]),
+    }
+    fname = HISTORY_DIR / f"snap-{datetime.now().strftime('%Y%m%d%H%M%S%f')}.json"
+    fname.write_text(json.dumps(snapshot))
+    os.chmod(fname, 0o600)
+
+    # Prune oldest beyond the cap so this can't grow unbounded.
+    for old in _snapshot_paths()[MAX_HISTORY_SNAPSHOTS:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def load_snapshot_summaries():
+    summaries = []
+    for p in _snapshot_paths():
+        try:
+            data = json.loads(p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        summaries.append({
+            "id": p.stem,
+            "time": data.get("time", "?"),
+            "label": data.get("label", ""),
+            "client_count": len(data.get("clients", []) or []),
+            "has_server_cert": bool(data.get("server_cert")),
+        })
+    return summaries
+
+
+def restore_snapshot(snapshot_id):
+    """Restores clients + certificates from a snapshot by id. Returns the
+    restored snapshot dict, or None if the id is invalid/missing (the id
+    format is validated here since it's used to build a filesystem path)."""
+    if not re.match(r'^snap-\d+$', snapshot_id or ""):
+        return None
+    p = HISTORY_DIR / f"{snapshot_id}.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    save_clients(data.get("clients", []) or [])
+    paths = eap_tls_paths()
+    gen_paths = generated_ca_paths()
+
+    def _restore(path, b64):
+        if b64:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(base64.b64decode(b64))
+            os.chmod(path, 0o640)
+        elif path.exists():
+            path.unlink()
+
+    _restore(paths["server_cert"], data.get("server_cert"))
+    _restore(paths["server_key"], data.get("server_key"))
+    _restore(paths["ca_bundle"], data.get("ca_bundle"))
+    _restore(gen_paths["cert"], data.get("generated_ca_cert"))
+    _restore(gen_paths["key"], data.get("generated_ca_key"))
+    return data
 
 
 # --------------------------------------------------------------------------
@@ -870,6 +978,31 @@ def parse_auth_log(log_file, minutes, max_lines=50000):
     return entries, counts, None
 
 
+def get_last_auth_event(log_file):
+    """Cheap single-line read for the Servers page - avoids tailing/parsing
+    the whole log just to show a timestamp."""
+    if not log_file or not Path(log_file).exists():
+        return None
+    rc, out = run(["tail", "-n", "1", str(log_file)])
+    if rc != 0 or not out.strip():
+        return None
+    parts = out.strip().split("|", 8)
+    if len(parts) != 9:
+        return None
+    ts_raw, outcome, user = parts[0], parts[1], parts[2]
+    try:
+        ts = float(ts_raw)
+    except ValueError:
+        return None
+    if outcome not in ("Accept", "Reject"):
+        return None
+    return {
+        "time": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+        "outcome": outcome,
+        "user": user or "-",
+    }
+
+
 # --------------------------------------------------------------------------
 # Status / health checks + pending-changes detection
 # --------------------------------------------------------------------------
@@ -962,17 +1095,46 @@ def certs():
         action = request.form.get("action")
         CERTS_DIR.mkdir(parents=True, exist_ok=True)
 
-        if action == "upload_server":
+        if action == "delete_generated_ca":
+            gen_paths = generated_ca_paths()
+            if not gen_paths["cert"].exists():
+                flash("No GUI-generated root CA to remove", "error")
+                return redirect(url_for("certs"))
+            save_config_snapshot("Before removing GUI-generated root CA")
+            removed_server_cert = False
+            for p in (gen_paths["cert"], gen_paths["key"]):
+                if p.exists():
+                    p.unlink()
+            # Only clear the active server cert/key if they were actually issued
+            # by this root - if the admin later uploaded a different cert on top
+            # (option A/B/C), leave that one alone.
+            if STATE.get("root_ca_source") == "local":
+                for p in (paths["server_cert"], paths["server_key"]):
+                    if p.exists():
+                        p.unlink()
+                        removed_server_cert = True
+                STATE.pop("root_ca_source", None)
+                _persist_state()
+            msg = "Removed the GUI-generated root CA."
+            if removed_server_cert:
+                msg += (" Its server certificate was also removed, since it was issued by this "
+                        "root and can't be renewed without it - upload or generate a new one "
+                        "before applying, or FreeRADIUS will fail to start.")
+            flash(msg, "success")
+
+        elif action == "upload_server":
             try:
                 cert_pem, key_pem, key_password = build_server_cert_key(request.form, request.files)
             except CertError as e:
                 flash(f"Certificate not saved: {e}", "error")
                 return redirect(url_for("certs"))
+            save_config_snapshot("Before uploading a new server certificate")
             paths["server_cert"].write_text(cert_pem)
             paths["server_key"].write_text(key_pem)
             os.chmod(paths["server_cert"], 0o640)
             os.chmod(paths["server_key"], 0o640)
             STATE["last_key_password"] = key_password
+            STATE.pop("root_ca_source", None)
             _persist_state()
             info = cert_display_info(_load_all_certs(cert_pem.encode())[0])
             msg = f"Server certificate saved and verified (subject: {info['subject']})."
@@ -991,6 +1153,7 @@ def certs():
                 return redirect(url_for("certs"))
             existing_pems = existing_ca_pems(paths["ca_bundle"]) if mode == "append" else []
             combined = combine_ca_pems(existing_pems, new_pems)
+            save_config_snapshot("Before updating trusted CA bundle")
             paths["ca_bundle"].write_text("".join(combined))
             os.chmod(paths["ca_bundle"], 0o640)
             flash(f"Trusted CA bundle saved ({len(combined)} certificate(s) total). "
@@ -1006,6 +1169,7 @@ def certs():
                 try:
                     certs_list = [_cert_to_pem(c) for c in _load_all_certs(paths["ca_bundle"].read_bytes())]
                     if 0 <= idx < len(certs_list):
+                        save_config_snapshot("Before removing a certificate from the trusted CA bundle")
                         del certs_list[idx]
                         paths["ca_bundle"].write_text("".join(certs_list))
                         flash("Certificate removed from CA bundle. Go to Dashboard and click Apply.", "success")
@@ -1032,6 +1196,7 @@ def certs():
             ca_key, ca_cert = _build_ca_cert(ca_cn, validity_years)
             server_key, server_cert = _build_server_cert(ca_key, ca_cert, server_cn, san_entries, validity_years)
 
+            save_config_snapshot("Before generating a new self-signed root CA + server cert")
             gen_paths = generated_ca_paths()
             gen_paths["key"].write_text(_key_to_pem(ca_key, ""))
             gen_paths["cert"].write_text(_cert_to_pem(ca_cert))
@@ -1079,6 +1244,7 @@ def certs():
                 return redirect(url_for("certs"))
 
             server_key, server_cert = _build_server_cert(ca_key, ca_cert, server_cn, san_entries, validity_years)
+            save_config_snapshot("Before renewing self-signed server certificate")
             paths["server_cert"].write_text(_cert_to_pem(server_cert))
             paths["server_key"].write_text(_key_to_pem(server_key, ""))
             os.chmod(paths["server_cert"], 0o640)
@@ -1139,6 +1305,7 @@ def certs():
                 flash(f"Could not get a certificate from {peer_label}: {err}", "error")
                 return redirect(url_for("certs"))
 
+            save_config_snapshot(f"Before requesting a certificate from {peer_label}")
             paths["server_cert"].write_text(result["cert_pem"])
             paths["server_key"].write_text(_key_to_pem(server_key, ""))
             os.chmod(paths["server_cert"], 0o640)
@@ -1245,10 +1412,13 @@ def clients():
 
             if action == "edit":
                 orig_name = request.form.get("orig_name", "")
+                save_config_snapshot(f"Before editing client '{orig_name}'")
                 all_clients = [c for c in all_clients if c["name"] != orig_name]
             elif any(c["name"] == name for c in all_clients):
                 flash(f"A client named '{name}' already exists", "error")
                 return redirect(url_for("clients"))
+            else:
+                save_config_snapshot(f"Before adding client '{name}'")
 
             all_clients.append(new_entry)
             save_clients(all_clients)
@@ -1256,6 +1426,7 @@ def clients():
 
         elif action == "delete":
             name = request.form.get("name", "")
+            save_config_snapshot(f"Before deleting client '{name}'")
             all_clients = [c for c in all_clients if c["name"] != name]
             save_clients(all_clients)
             flash(f"Client '{name}' deleted. Go to Dashboard and click Apply.", "success")
@@ -1279,35 +1450,14 @@ def auth_log():
     except ValueError:
         minutes = 60
     autorefresh = request.args.get("autorefresh") == "1"
-    combined = request.args.get("combined") == "1" and bool(STATE.get("known_servers"))
     log_file = STATE.get("auth_log_file") or (auth_log_path() if RADIUSD_CONF.exists() else None)
     # "All time" (minutes<=0) needs a much bigger tail buffer, since a wide
     # window on a busy server can span far more than the usual 50k-line default.
     max_lines = 500000 if minutes <= 0 else 50000
     entries, counts, err = parse_auth_log(log_file, minutes, max_lines=max_lines)
-    for e in entries:
-        e["server"] = socket.gethostname()
-
-    peer_errors = []
-    if combined:
-        for s in STATE.get("known_servers", []):
-            peer_entries, perr = _fetch_peer_auth_log(s["url"], s.get("token", ""), minutes)
-            label = s.get("name") or s["url"]
-            if perr:
-                peer_errors.append(f"{label} ({perr})")
-                continue
-            for e in peer_entries:
-                e["server"] = label
-                entries.append(e)
-                key = "accept" if e["outcome"] == "Accept" else "reject"
-                counts[key] = counts.get(key, 0) + 1
-        entries.sort(key=lambda e: e["sort_ts"], reverse=True)
-
     return render_template(
         "auth_log.html", entries=entries, counts=counts, error=err,
         minutes=minutes, autorefresh=autorefresh, log_file=log_file,
-        combined=combined, peer_errors=peer_errors,
-        has_known_servers=bool(STATE.get("known_servers")),
     )
 
 
@@ -1426,13 +1576,6 @@ def _fetch_peer_status(url, token, timeout=5):
 
 def _fetch_peer_config_summary(url, token, timeout=5):
     return _peer_request(url, token, "/api/config-summary", timeout=timeout)
-
-
-def _fetch_peer_auth_log(url, token, minutes, timeout=8):
-    data, err = _peer_request(url, token, f"/api/auth-log?range={minutes}", timeout=timeout)
-    if err:
-        return [], err
-    return data.get("entries", []), None
 
 
 def _request_csr_signature(url, token, csr_pem, validity_years, timeout=10):
@@ -1611,6 +1754,7 @@ def api_status():
     paths = eap_tls_paths()
     server_cert = cert_info(paths["server_cert"])
     ca_bundle = certs_info_list(paths["ca_bundle"])
+    log_file = STATE.get("auth_log_file") or (auth_log_path() if RADIUSD_CONF.exists() else None)
     return jsonify({
         "name": socket.gethostname(),
         "freeradius_status": service_status(),
@@ -1619,6 +1763,7 @@ def api_status():
         "pending_changes": compute_pending_hash() != STATE.get("last_applied_hash"),
         "cert_warning": any_cert_warning({"server_cert": server_cert, "ca_bundle": ca_bundle}),
         "last_apply": STATE.get("last_apply"),
+        "last_auth": get_last_auth_event(log_file),
     })
 
 
@@ -1629,20 +1774,6 @@ def api_config_summary():
     is and isn't included. Used by a peer's Servers page to check config
     drift without either side ever sending the other its actual secrets."""
     return jsonify(build_config_summary(STATE.get("api_key", "").encode()))
-
-
-@app.route("/api/auth-log")
-@api_key_required
-def api_auth_log():
-    try:
-        minutes = int(request.args.get("range", "60"))
-    except ValueError:
-        minutes = 60
-    log_file = STATE.get("auth_log_file") or (auth_log_path() if RADIUSD_CONF.exists() else None)
-    max_lines = 500000 if minutes <= 0 else 50000
-    entries, _counts, err = parse_auth_log(log_file, minutes, max_lines=max_lines)
-    # Cap the payload - this is meant for a quick combined view, not bulk export.
-    return jsonify({"entries": entries[:1000], "server_name": socket.gethostname(), "error": err})
 
 
 @app.route("/api/sign-csr", methods=["POST"])
@@ -1683,6 +1814,29 @@ def api_sign_csr():
     })
 
 
+@app.route("/changelog", methods=["GET", "POST"])
+@login_required
+def changelog():
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "revert":
+            snapshot_id = request.form.get("snapshot_id", "")
+            # Snapshot the current state first, so reverting is itself
+            # reversible - "before this revert" becomes a normal entry too.
+            save_config_snapshot(f"Before reverting to a previous snapshot ({snapshot_id})")
+            restored = restore_snapshot(snapshot_id)
+            if restored is None:
+                flash("Could not find that snapshot - it may have been pruned", "error")
+            else:
+                flash(
+                    f"Reverted configuration to the snapshot from {restored.get('time', '?')} "
+                    f"({restored.get('label', '')}). Go to Dashboard and click Apply to activate it.",
+                    "success",
+                )
+        return redirect(url_for("changelog"))
+    return render_template("changelog.html", snapshots=load_snapshot_summaries())
+
+
 @app.route("/servers")
 @login_required
 def servers():
@@ -1706,7 +1860,11 @@ def servers():
             "name": s.get("name") or s["url"], "url": s["url"], "data": data, "error": err,
             "config_diffs": config_diffs, "config_error": config_error,
         })
-    return render_template("servers.html", results=results, this_hostname=socket.gethostname())
+    log_file = STATE.get("auth_log_file") or (auth_log_path() if RADIUSD_CONF.exists() else None)
+    return render_template(
+        "servers.html", results=results, this_hostname=socket.gethostname(),
+        this_last_auth=get_last_auth_event(log_file),
+    )
 
 
 EXPORT_README = (
