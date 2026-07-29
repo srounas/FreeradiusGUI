@@ -79,6 +79,12 @@
     <p><a href="{{ url_for('download_generated_ca', fmt='der') }}">Download root CA (.cer, for Intune)</a>
        &middot; <a href="{{ url_for('download_generated_ca', fmt='pem') }}">Download root CA (.pem)</a></p>
 
+    <form method="post" style="display:inline" onsubmit="return confirm('Remove the GUI-generated root CA? If the current server certificate was issued by it, that gets removed too - you would need to upload or generate a replacement before applying, or FreeRADIUS will fail to start. This cannot be undone from here, though a pre-removal snapshot is kept on the Changelog page.')">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="action" value="delete_generated_ca">
+      <button type="submit" class="link-btn danger">Remove root CA</button>
+    </form>
+
     <form method="post" class="inline" style="flex-wrap:wrap; align-items:flex-end">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <input type="hidden" name="action" value="renew_selfsigned_server">

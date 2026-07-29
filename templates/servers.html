@@ -6,6 +6,14 @@
 <div class="card">
   <h2>This server</h2>
   <p class="muted">{{ this_hostname }}</p>
+  {% if this_last_auth %}
+    <p class="muted">Last authentication: {{ this_last_auth.time }}
+      <span class="badge {{ 'ok' if this_last_auth.outcome == 'Accept' else 'bad' }}">{{ this_last_auth.outcome }}</span>
+      {% if this_last_auth.user %} &middot; {{ this_last_auth.user }}{% endif %}
+    </p>
+  {% else %}
+    <p class="muted">No authentication events recorded yet.</p>
+  {% endif %}
 </div>
 
 {% if results %}
@@ -22,6 +30,14 @@
       </p>
       {% if r.data.freeradius_version %}<p class="muted">Version: {{ r.data.freeradius_version }}</p>{% endif %}
       <p class="muted">{{ r.data.client_count }} client(s) configured</p>
+      {% if r.data.last_auth %}
+        <p class="muted">Last authentication: {{ r.data.last_auth.time }}
+          <span class="badge {{ 'ok' if r.data.last_auth.outcome == 'Accept' else 'bad' }}">{{ r.data.last_auth.outcome }}</span>
+          {% if r.data.last_auth.user %} &middot; {{ r.data.last_auth.user }}{% endif %}
+        </p>
+      {% else %}
+        <p class="muted">No authentication events recorded yet.</p>
+      {% endif %}
       {% if r.data.last_apply %}
         <p class="muted">Last apply: {{ r.data.last_apply.time }}
           <span class="badge {{ 'ok' if r.data.last_apply.success else 'bad' }}">{{ 'OK' if r.data.last_apply.success else 'FAILED' }}</span>

@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Changelog - FreeRADIUS GUI{% endblock %}
+{% block content %}
+<h1>Changelog</h1>
+<p class="muted">Every time clients or certificates are changed here, a snapshot of the previous
+  state is saved automatically - up to the most recent 20. You can revert to any of them below.
+  Reverting only changes what's on disk here; go to the <a href="{{ url_for('dashboard') }}">Dashboard</a>
+  and click Apply afterward to actually activate it.</p>
+
+<div class="card">
+  {% if snapshots %}
+  <table>
+    <thead><tr><th>Time</th><th>Change</th><th>Clients</th><th>Server cert</th><th></th></tr></thead>
+    <tbody>
+    {% for s in snapshots %}
+      <tr>
+        <td class="muted">{{ s.time }}</td>
+        <td>{{ s.label }}</td>
+        <td class="muted">{{ s.client_count }}</td>
+        <td class="muted">{{ 'yes' if s.has_server_cert else '-' }}</td>
+        <td>
+          <form method="post" style="display:inline"
+                onsubmit="return confirm('Revert clients and certificates to how they were right before: {{ s.label }} ({{ s.time }})? The current state is snapshotted first, so this can be undone too. You still need to click Apply on the Dashboard afterward.')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="action" value="revert">
+            <input type="hidden" name="snapshot_id" value="{{ s.id }}">
+            <button type="submit" class="link-btn">revert to this</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No snapshots yet - one is taken automatically the next time you change a client
+    or certificate.</p>
+  {% endif %}
+</div>
+{% endblock %}

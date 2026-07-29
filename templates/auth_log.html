@@ -19,17 +19,8 @@
       <input type="checkbox" name="autorefresh" value="1" {{ 'checked' if autorefresh }} onchange="this.form.submit()">
       Auto-refresh every 15s
     </label>
-    {% if has_known_servers %}
-    <label class="checkbox" style="margin-bottom:9px">
-      <input type="checkbox" name="combined" value="1" {{ 'checked' if combined }} onchange="this.form.submit()">
-      Combine with known servers
-    </label>
-    {% endif %}
     <noscript><button type="submit">Refresh</button></noscript>
   </form>
-  {% if peer_errors %}
-    <p class="muted">Couldn't reach: {{ peer_errors|join(', ') }}</p>
-  {% endif %}
 </div>
 
 {% if error %}
@@ -53,14 +44,12 @@
   <div style="overflow-x:auto">
   <table id="events-table">
     <thead><tr>
-      {% if combined %}<th>Server</th>{% endif %}
       <th>Time</th><th>Result</th><th>User</th><th>NAS client</th><th>NAS IP</th>
       <th>MAC (Calling-Station-Id)</th><th>Certificate CN</th><th>EAP type</th><th>Reason</th>
     </tr></thead>
     <tbody>
     {% for e in entries %}
       <tr>
-        {% if combined %}<td class="muted">{{ e.server }}</td>{% endif %}
         <td class="muted">{{ e.time }}</td>
         <td><span class="badge {{ 'ok' if e.outcome == 'Accept' else 'bad' }}">{{ e.outcome }}</span></td>
         <td>{{ e.user }}</td>
