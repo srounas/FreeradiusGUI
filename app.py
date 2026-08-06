@@ -9,12 +9,14 @@ Runs on the same host as FreeRADIUS. Edits the real config files, validates
 with `freeradius -CX`, and restarts the service.
 """
 import base64
+import grp
 import hashlib
 import hmac
 import io
 import ipaddress
 import json
 import os
+import pwd
 import re
 import secrets
 import socket
@@ -139,6 +141,103 @@ RADIUSD_BIN = STATE.get("radiusd_bin", "freeradius")
 _failed_logins = {}  # in-memory login throttle: {ip: [failure timestamps]}
 
 
+# --------------------------------------------------------------------------
+# Ownership of files FreeRADIUS itself has to read
+# --------------------------------------------------------------------------
+# This app (per install.sh) runs as root, but FreeRADIUS drops privileges to
+# an unprivileged account (security.user/security.group in radiusd.conf -
+# "freerad" on Debian/Ubuntu, "radiusd" on RHEL-likes) before it ever opens
+# a cert, key, or clients.conf. A file written by this app and only chmod'd
+# 0640 is owned by root:root - readable by root and root's group, NOT by
+# that account - so FreeRADIUS fails with a permission error at exactly the
+# point it tries to load it. This bit us the first time someone replaced
+# the install-generated certificate (owned correctly by the installer) with
+# their own upload (owned by whoever/whatever wrote it): identical
+# permissions, wrong owner. Every write below now goes through
+# secure_radius_file() so mode AND ownership are always set together.
+
+_radius_uid_gid_cache = None
+
+
+def _detect_radius_user_group():
+    """Read the account FreeRADIUS actually drops privileges to from the
+    security {} block in radiusd.conf, so this doesn't hard-code a
+    distro-specific username. Falls back to 'freerad' (the Debian/Ubuntu
+    default) if radiusd.conf can't be read or parsed."""
+    default = ("freerad", "freerad")
+    if not RADIUSD_CONF.exists():
+        return default
+    try:
+        text = RADIUSD_CONF.read_text()
+    except OSError:
+        return default
+    m = re.search(r'\bsecurity\s*\{([^}]*)\}', text, re.DOTALL)
+    if not m:
+        return default
+    block = m.group(1)
+    user_m = re.search(r'^\s*user\s*=\s*"?([\w.-]+)"?', block, re.MULTILINE)
+    group_m = re.search(r'^\s*group\s*=\s*"?([\w.-]+)"?', block, re.MULTILINE)
+    return (user_m.group(1) if user_m else default[0],
+            group_m.group(1) if group_m else default[1])
+
+
+def radius_uid_gid():
+    """Resolve the (uid, gid) FreeRADIUS runs as. Checks for an explicit
+    override in config.json first (radius_user/radius_group - useful if
+    autodetection ever guesses wrong), otherwise parses radiusd.conf.
+    Cached for the life of the process; returns (None, None) if the
+    account doesn't exist on this system so callers can warn instead of
+    crashing the request."""
+    global _radius_uid_gid_cache
+    if _radius_uid_gid_cache is not None:
+        return _radius_uid_gid_cache
+    user = STATE.get("radius_user")
+    group = STATE.get("radius_group")
+    if not user or not group:
+        user, group = _detect_radius_user_group()
+    try:
+        result = (pwd.getpwnam(user).pw_uid, grp.getgrnam(group).gr_gid)
+    except KeyError:
+        app.logger.warning(
+            "FreeRADIUS service account '%s:%s' not found on this system - "
+            "cert/config files will be chmod'd but NOT chowned, which will "
+            "likely make FreeRADIUS unable to read them. Set radius_user / "
+            "radius_group in %s to correct this.", user, group, CONFIG_FILE)
+        result = (None, None)
+    _radius_uid_gid_cache = result
+    return result
+
+
+def secure_radius_file(path, mode=0o640):
+    """Set both the mode AND the owner on a file FreeRADIUS reads directly
+    (server cert/key, CA bundle, clients.conf, ...). Use this instead of a
+    bare os.chmod() for anything under CERTS_DIR or CLIENTS_CONF - chmod
+    alone isn't enough when this app's own process (root) and FreeRADIUS's
+    process (freerad/radiusd) are different accounts."""
+    os.chmod(path, mode)
+    uid, gid = radius_uid_gid()
+    if uid is None:
+        return
+    try:
+        os.chown(path, uid, gid)
+    except OSError as e:
+        app.logger.warning("Could not chown %s to the FreeRADIUS service account: %s", path, e)
+
+
+def ensure_certs_dir():
+    """Create CERTS_DIR if needed and make sure FreeRADIUS's account can
+    at least traverse/list it - a directory left root:root 0700 blocks
+    reads of files inside it regardless of the files' own permissions."""
+    CERTS_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CERTS_DIR, 0o750)
+    uid, gid = radius_uid_gid()
+    if uid is not None:
+        try:
+            os.chown(CERTS_DIR, uid, gid)
+        except OSError as e:
+            app.logger.warning("Could not chown %s to the FreeRADIUS service account: %s", CERTS_DIR, e)
+
+
 def load_clients():
     if not CLIENTS_FILE.exists():
         return []
@@ -240,7 +339,7 @@ def restore_snapshot(snapshot_id):
         if b64:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(base64.b64decode(b64))
-            os.chmod(path, 0o640)
+            secure_radius_file(path, 0o640)
         elif path.exists():
             path.unlink()
 
@@ -797,7 +896,7 @@ def write_clients_conf(clients):
     CLIENTS_CONF.write_text(render_clients_conf(clients))
     # Contains shared secrets in plaintext - keep it as locked down as the
     # other secret-bearing files this app manages.
-    os.chmod(CLIENTS_CONF, 0o640)
+    secure_radius_file(CLIENTS_CONF, 0o640)
 
 
 # --------------------------------------------------------------------------
@@ -1093,7 +1192,7 @@ def certs():
     paths = eap_tls_paths()
     if request.method == "POST":
         action = request.form.get("action")
-        CERTS_DIR.mkdir(parents=True, exist_ok=True)
+        ensure_certs_dir()
 
         if action == "delete_generated_ca":
             gen_paths = generated_ca_paths()
@@ -1131,8 +1230,8 @@ def certs():
             save_config_snapshot("Before uploading a new server certificate")
             paths["server_cert"].write_text(cert_pem)
             paths["server_key"].write_text(key_pem)
-            os.chmod(paths["server_cert"], 0o640)
-            os.chmod(paths["server_key"], 0o640)
+            secure_radius_file(paths["server_cert"], 0o640)
+            secure_radius_file(paths["server_key"], 0o640)
             STATE["last_key_password"] = key_password
             STATE.pop("root_ca_source", None)
             _persist_state()
@@ -1155,7 +1254,7 @@ def certs():
             combined = combine_ca_pems(existing_pems, new_pems)
             save_config_snapshot("Before updating trusted CA bundle")
             paths["ca_bundle"].write_text("".join(combined))
-            os.chmod(paths["ca_bundle"], 0o640)
+            secure_radius_file(paths["ca_bundle"], 0o640)
             flash(f"Trusted CA bundle saved ({len(combined)} certificate(s) total). "
                   "Go to Dashboard and click Apply.", "success")
 
@@ -1200,13 +1299,13 @@ def certs():
             gen_paths = generated_ca_paths()
             gen_paths["key"].write_text(_key_to_pem(ca_key, ""))
             gen_paths["cert"].write_text(_cert_to_pem(ca_cert))
-            os.chmod(gen_paths["key"], 0o600)
-            os.chmod(gen_paths["cert"], 0o640)
+            secure_radius_file(gen_paths["key"], 0o600)
+            secure_radius_file(gen_paths["cert"], 0o640)
 
             paths["server_cert"].write_text(_cert_to_pem(server_cert))
             paths["server_key"].write_text(_key_to_pem(server_key, ""))
-            os.chmod(paths["server_cert"], 0o640)
-            os.chmod(paths["server_key"], 0o640)
+            secure_radius_file(paths["server_cert"], 0o640)
+            secure_radius_file(paths["server_key"], 0o640)
             STATE["last_key_password"] = ""
             STATE["root_ca_source"] = "local"
             STATE.pop("root_ca_issuer_name", None)
@@ -1247,8 +1346,8 @@ def certs():
             save_config_snapshot("Before renewing self-signed server certificate")
             paths["server_cert"].write_text(_cert_to_pem(server_cert))
             paths["server_key"].write_text(_key_to_pem(server_key, ""))
-            os.chmod(paths["server_cert"], 0o640)
-            os.chmod(paths["server_key"], 0o640)
+            secure_radius_file(paths["server_cert"], 0o640)
+            secure_radius_file(paths["server_key"], 0o640)
             STATE["last_key_password"] = ""
             _persist_state()
 
@@ -1308,8 +1407,8 @@ def certs():
             save_config_snapshot(f"Before requesting a certificate from {peer_label}")
             paths["server_cert"].write_text(result["cert_pem"])
             paths["server_key"].write_text(_key_to_pem(server_key, ""))
-            os.chmod(paths["server_cert"], 0o640)
-            os.chmod(paths["server_key"], 0o640)
+            secure_radius_file(paths["server_cert"], 0o640)
+            secure_radius_file(paths["server_key"], 0o640)
             STATE["last_key_password"] = ""
 
             # Cache a local copy of the issuer's root cert (public part only -
@@ -1324,7 +1423,7 @@ def certs():
                 flash(f"Note: this server previously had its own root CA key - it was moved to "
                       f"{backup.name} rather than deleted, in case you need it back.", "warn")
             gen_paths["cert"].write_text(result["root_cert_pem"])
-            os.chmod(gen_paths["cert"], 0o640)
+            secure_radius_file(gen_paths["cert"], 0o640)
             STATE["root_ca_source"] = "remote"
             STATE["root_ca_issuer_name"] = peer_label
             _persist_state()
@@ -2003,12 +2102,12 @@ def backup_import():
             except CertError as e:
                 warnings.append(f"server certificate: import skipped ({e})")
             else:
-                CERTS_DIR.mkdir(parents=True, exist_ok=True)
+                ensure_certs_dir()
                 paths = eap_tls_paths()
                 paths["server_cert"].write_bytes(cert_bytes)
                 paths["server_key"].write_bytes(key_bytes)
-                os.chmod(paths["server_cert"], 0o640)
-                os.chmod(paths["server_key"], 0o640)
+                secure_radius_file(paths["server_cert"], 0o640)
+                secure_radius_file(paths["server_key"], 0o640)
                 results.append(f"server certificate ({certs[0].subject.rfc4514_string()})")
         else:
             warnings.append("server certificate: selected for import, but the export file didn't include one")
@@ -2021,12 +2120,12 @@ def backup_import():
             except CertError as e:
                 warnings.append(f"CA bundle: import skipped ({e})")
             else:
-                CERTS_DIR.mkdir(parents=True, exist_ok=True)
+                ensure_certs_dir()
                 paths = eap_tls_paths()
                 existing = existing_ca_pems(paths["ca_bundle"]) if ca_mode == "append" else []
                 combined = combine_ca_pems(existing, new_pems)
                 paths["ca_bundle"].write_text("".join(combined))
-                os.chmod(paths["ca_bundle"], 0o640)
+                secure_radius_file(paths["ca_bundle"], 0o640)
                 results.append(f"trusted CA bundle ({len(combined)} certificate(s) total)")
         else:
             warnings.append("CA bundle: selected for import, but the export file didn't include one")
