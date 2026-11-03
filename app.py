@@ -256,9 +256,9 @@ def save_clients(clients):
 # --------------------------------------------------------------------------
 # Configuration history (automatic snapshots + revert)
 # --------------------------------------------------------------------------
-# Captures the GUI-managed RADIUS clients and certificates - never host-level
-# settings like the admin password or bind address, which aren't part of
-# what "revert" is meant to undo. Stored under the same locked-down state
+# Captures the GUI-managed RADIUS clients, certificates and syslog settings -
+# never host-level settings like the admin password or bind address, which
+# aren't part of what "revert" is meant to undo. Stored under the same locked-down state
 # directory as everything else here (config.json, clients.json), so the same
 # file permissions model applies.
 
@@ -288,6 +288,10 @@ def save_config_snapshot(label):
         "ca_bundle": _b64(paths["ca_bundle"]),
         "generated_ca_cert": _b64(gen_paths["cert"]),
         "generated_ca_key": _b64(gen_paths["key"]),
+        # None = never configured (stock defaults). Snapshots from before this
+        # field existed lack the key entirely, which restore treats as "leave
+        # the current syslog settings alone".
+        "syslog": STATE.get("syslog"),
     }
     fname = HISTORY_DIR / f"snap-{datetime.now().strftime('%Y%m%d%H%M%S%f')}.json"
     fname.write_text(json.dumps(snapshot))
@@ -314,12 +318,13 @@ def load_snapshot_summaries():
             "label": data.get("label", ""),
             "client_count": len(data.get("clients", []) or []),
             "has_server_cert": bool(data.get("server_cert")),
+            "syslog": syslog_summary(data.get("syslog")),
         })
     return summaries
 
 
 def restore_snapshot(snapshot_id):
-    """Restores clients + certificates from a snapshot by id. Returns the
+    """Restores clients, certificates and syslog settings from a snapshot by id. Returns the
     restored snapshot dict, or None if the id is invalid/missing (the id
     format is validated here since it's used to build a filesystem path)."""
     if not re.match(r'^snap-\d+$', snapshot_id or ""):
@@ -349,6 +354,16 @@ def restore_snapshot(snapshot_id):
     _restore(paths["ca_bundle"], data.get("ca_bundle"))
     _restore(gen_paths["cert"], data.get("generated_ca_cert"))
     _restore(gen_paths["key"], data.get("generated_ca_key"))
+
+    if "syslog" in data:
+        saved = data["syslog"]
+        if saved is None:
+            STATE.pop("syslog", None)
+        else:
+            cfg, errors = syslog_from_dict(saved)
+            if not errors:
+                STATE["syslog"] = cfg
+        _persist_state()
     return data
 
 
@@ -1150,6 +1165,38 @@ def get_syslog_settings():
     return cfg
 
 
+def syslog_from_dict(d):
+    """Validate a stored or imported settings dict with exactly the rules the
+    web form uses, so a tampered export or snapshot can't smuggle anything
+    into the FreeRADIUS/rsyslog config that the page itself would refuse."""
+    if not isinstance(d, dict):
+        return None, ["syslog settings are not a JSON object"]
+    form = {}
+    for key, value in d.items():
+        if isinstance(value, bool):
+            if value:
+                form[key] = "on"
+        elif value is not None:
+            form[key] = str(value)
+    return parse_syslog_form(form)
+
+
+def syslog_summary(cfg):
+    """Short human-readable description for the changelog / backup pages.
+    "" = never configured (or unknown), "default" = saved but all stock."""
+    if not isinstance(cfg, dict):
+        return ""
+    cfg = {**SYSLOG_DEFAULTS, **cfg}
+    parts = []
+    if cfg["destination"] == "syslog":
+        parts.append(f"log to syslog ({cfg['facility']})")
+    if cfg["events_enabled"]:
+        parts.append("auth events")
+    if cfg["remote_enabled"] and cfg["remote_host"]:
+        parts.append(f"remote {cfg['remote_host']}")
+    return ", ".join(parts) or "default"
+
+
 def parse_syslog_form(form):
     """Validate the syslog form. Returns (settings_dict, [error strings]).
     Every value ends up inside a config file FreeRADIUS or rsyslog parses,
@@ -1881,6 +1928,8 @@ def syslog_settings():
                 flash(e, "error")
             cfg = new_cfg  # re-show what was typed instead of discarding it
         else:
+            if new_cfg != cfg:
+                save_config_snapshot("Before changing syslog settings")
             STATE["syslog"] = new_cfg
             _persist_state()
             if new_cfg["remote_enabled"] and new_cfg["destination"] != "syslog" and not new_cfg["events_enabled"]:
@@ -2062,7 +2111,61 @@ def build_config_summary(hmac_key: bytes):
         "ca_bundle_fingerprints": ca_fps,
         "root_ca_fingerprint": _fp(generated_ca_paths()["cert"]),
         "freeradius_version": freeradius_version(),
+        # Not secret (no keys or credentials), so sent as plain values - the
+        # diff can then say what differs rather than just that it does.
+        "syslog": get_syslog_settings(),
     }
+
+
+SYSLOG_FIELD_LABELS = {
+    "destination": "FreeRADIUS log destination",
+    "facility": "log facility",
+    "log_auth": "logging of auth requests",
+    "log_auth_badpass": "passwords on failed attempts",
+    "log_auth_goodpass": "passwords on successful attempts",
+    "events_enabled": "syslog auth events",
+    "event_facility": "auth event facility",
+    "event_severity": "auth event severity",
+    "remote_enabled": "remote forwarding",
+    "remote_host": "remote syslog host",
+    "remote_port": "remote syslog port",
+    "remote_protocol": "remote syslog protocol",
+    "remote_format": "remote syslog format",
+}
+
+
+def _diff_syslog_settings(local, remote):
+    """Differences in syslog settings between two servers. Settings that
+    can't have any effect on either side (e.g. the remote host while
+    forwarding is off on both) are not compared, so leftover values don't
+    raise false drift alarms. A peer on an older version that doesn't report
+    syslog settings at all is called out instead of being treated as
+    'differs from defaults'."""
+    if remote is None:
+        return ["The other server doesn't report syslog settings - it is probably running an older "
+                "version; upgrade it to compare syslog configuration"]
+    a = {**SYSLOG_DEFAULTS, **(local or {})}
+    b = {**SYSLOG_DEFAULTS, **remote}
+
+    fields = ["destination"]
+    if "syslog" in (a["destination"], b["destination"]):
+        fields.append("facility")
+    fields += ["log_auth", "log_auth_badpass", "log_auth_goodpass", "events_enabled"]
+    if a["events_enabled"] or b["events_enabled"]:
+        fields += ["event_facility", "event_severity"]
+    fields.append("remote_enabled")
+    if a["remote_enabled"] or b["remote_enabled"]:
+        fields += ["remote_host", "remote_port", "remote_protocol", "remote_format"]
+
+    def show(v):
+        if isinstance(v, bool):
+            return "on" if v else "off"
+        return str(v) if v not in ("", None) else "(not set)"
+
+    return [
+        f"Syslog: {SYSLOG_FIELD_LABELS[f]} is {show(a[f])} on this server but {show(b[f])} on the other"
+        for f in fields if a[f] != b[f]
+    ]
 
 
 def diff_config_summaries(local, remote):
@@ -2111,6 +2214,8 @@ def diff_config_summaries(local, remote):
     if local.get("freeradius_version") != remote.get("freeradius_version"):
         diffs.append(f"FreeRADIUS version differs: {local.get('freeradius_version')} vs "
                       f"{remote.get('freeradius_version')}")
+
+    diffs.extend(_diff_syslog_settings(local.get("syslog"), remote.get("syslog")))
 
     return diffs
 
@@ -2304,8 +2409,8 @@ def servers():
 
 EXPORT_README = (
     "FreeRADIUS GUI configuration export.\n\n"
-    "Contains the GUI-managed RADIUS client list and/or certificates,\n"
-    "depending on what was selected at export time. Import this file on\n"
+    "Contains the GUI-managed RADIUS client list, certificates and/or\n"
+    "syslog settings, depending on what was selected at export time. Import this file on\n"
     "another FreeRADIUS GUI instance via the Backup & Transfer page to\n"
     "clone this server's client/certificate configuration onto it. Admin\n"
     "login credentials and host-specific settings (bind address, config\n"
@@ -2339,7 +2444,10 @@ def _validate_client_list(data):
 @app.route("/backup")
 @login_required
 def backup():
-    return render_template("backup.html", client_count=len(load_clients()))
+    return render_template(
+        "backup.html", client_count=len(load_clients()),
+        syslog_summary=syslog_summary(get_syslog_settings()) or "default",
+    )
 
 
 @app.route("/backup/export")
@@ -2347,6 +2455,7 @@ def backup():
 def backup_export():
     include_clients = request.args.get("clients") is not None
     include_certs = request.args.get("certs") is not None
+    include_syslog = request.args.get("syslog") is not None
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -2356,11 +2465,15 @@ def backup_export():
             "exported_from": socket.gethostname(),
             "includes_clients": include_clients,
             "includes_certs": include_certs,
+            "includes_syslog": include_syslog,
         }
         zf.writestr("manifest.json", json.dumps(manifest, indent=2))
 
         if include_clients:
             zf.writestr("clients.json", json.dumps(load_clients(), indent=2))
+
+        if include_syslog:
+            zf.writestr("syslog.json", json.dumps(get_syslog_settings(), indent=2))
 
         if include_certs:
             paths = eap_tls_paths()
@@ -2384,6 +2497,8 @@ def backup_import():
     clients_mode = request.form.get("clients_mode", "off")
     import_server_cert = bool(request.form.get("import_server_cert"))
     ca_mode = request.form.get("ca_mode", "off")
+    syslog_mode = request.form.get("syslog_mode", "off")
+    syslog_keep_remote = bool(request.form.get("syslog_keep_remote"))
 
     if not f or not f.filename:
         flash("Choose an export .zip file to import first", "error")
@@ -2424,6 +2539,32 @@ def backup_import():
                 results.append(msg)
     elif clients_mode != "off":
         warnings.append("clients: selected for import, but the export file didn't include clients.json")
+
+    # --- syslog settings ---
+    if syslog_mode != "off":
+        if "syslog.json" not in names:
+            warnings.append("syslog settings: selected for import, but the export file didn't include them")
+        else:
+            try:
+                imported_syslog, syslog_errors = syslog_from_dict(json.loads(zf.read("syslog.json")))
+            except json.JSONDecodeError as e:
+                imported_syslog, syslog_errors = None, [f"not valid JSON: {e}"]
+            if syslog_errors:
+                warnings.append("syslog settings: import skipped (" + "; ".join(syslog_errors) + ")")
+            else:
+                current_syslog = get_syslog_settings()
+                if syslog_keep_remote:
+                    for key in ("remote_enabled", "remote_host", "remote_port",
+                                "remote_protocol", "remote_format"):
+                        imported_syslog[key] = current_syslog[key]
+                if imported_syslog == current_syslog:
+                    results.append("syslog settings (already identical to this server's)")
+                else:
+                    save_config_snapshot("Before importing syslog settings")
+                    STATE["syslog"] = imported_syslog
+                    _persist_state()
+                    results.append("syslog settings" + (" (this server's own remote target kept)"
+                                                          if syslog_keep_remote else ""))
 
     # --- server cert + key ---
     if import_server_cert:

@@ -2,7 +2,7 @@
 {% block title %}Backup & Transfer - FreeRADIUS GUI{% endblock %}
 {% block content %}
 <h1>Backup &amp; Transfer</h1>
-<p class="muted">Export this server's RADIUS clients and/or certificates to a file, then import it on
+<p class="muted">Export this server's RADIUS clients, certificates and/or syslog settings to a file, then import it on
   another FreeRADIUS GUI instance to give it an identical configuration. Admin login and
   host-specific settings (bind address, config paths) are never included - each server keeps its own.</p>
 
@@ -17,6 +17,10 @@
     <label class="checkbox">
       <input type="checkbox" name="certs" value="1" checked>
       Server certificate + private key, and trusted CA bundle
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="syslog" value="1" checked>
+      Syslog settings ({{ syslog_summary }})
     </label>
     <button type="submit" class="primary">Download export (.zip)</button>
   </form>
@@ -53,6 +57,18 @@
         <option value="append" selected>Add to existing bundle (dedup automatically)</option>
         <option value="replace">Replace entire bundle</option>
       </select>
+    </label>
+
+    <label>Syslog settings
+      <select name="syslog_mode">
+        <option value="off" selected>Don't import</option>
+        <option value="replace">Replace this server's syslog settings</option>
+      </select>
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="syslog_keep_remote" value="1">
+      Keep this server's own remote syslog target (host, port, protocol, format) - useful when
+      importing from a server that forwards to a different collector
     </label>
 
     <button type="submit" class="primary">Import selected</button>

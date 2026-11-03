@@ -37,17 +37,31 @@ fi
 echo "Detected FreeRADIUS config dir: $RADDB"
 
 # --- detect service name ----------------------------------------------------
-SERVICE_NAME=""
-for svc in freeradius radiusd; do
-  if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service"; then
-    SERVICE_NAME="$svc"
-    break
-  fi
-done
-if [[ -z "$SERVICE_NAME" ]]; then
-  read -rp "Could not detect systemd service name. Enter it manually (e.g. freeradius or radiusd): " SERVICE_NAME
+# Never prompts. Order: SERVICE_NAME from the environment, then the value saved
+# by a previous install (so upgrades keep what they had), then detection, then
+# the default "freeradius". Detection captures systemctl's output instead of
+# piping into `grep -q`: under `set -o pipefail`, grep -q exits at the first
+# match, systemctl can die of SIGPIPE, and the pipeline then reports failure
+# even though the unit exists - which made this script always ask.
+SERVICE_NAME="${SERVICE_NAME:-}"
+if [[ -z "$SERVICE_NAME" && -f "$STATE_DIR/config.json" ]]; then
+  SERVICE_NAME="$(python3 -c "import json; print(json.load(open('$STATE_DIR/config.json')).get('service_name', ''))" 2>/dev/null || true)"
 fi
-echo "Detected service name: $SERVICE_NAME"
+if [[ -z "$SERVICE_NAME" ]]; then
+  for svc in freeradius radiusd; do
+    units="$(systemctl list-unit-files "${svc}.service" --no-legend 2>/dev/null || true)"
+    if [[ "$units" == *"${svc}.service"* ]]; then
+      SERVICE_NAME="$svc"
+      break
+    fi
+  done
+fi
+if [[ -z "$SERVICE_NAME" ]]; then
+  SERVICE_NAME="freeradius"
+  echo "No freeradius/radiusd systemd unit found yet - assuming '$SERVICE_NAME'." >&2
+  echo "(Override with: sudo SERVICE_NAME=radiusd ./install.sh)" >&2
+fi
+echo "Using FreeRADIUS service name: $SERVICE_NAME"
 
 # --- detect radiusd binary --------------------------------------------------
 RADIUSD_BIN=""
