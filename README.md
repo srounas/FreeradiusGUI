@@ -171,6 +171,18 @@ After upgrading, open the Dashboard and click **Apply** once so the current vers
 
 ---
 
+## Syslog
+
+[#syslog](#syslog)
+
+The **Syslog** page controls where FreeRADIUS sends its logs. Nothing changes on the server until you click **Apply** on the Dashboard.
+
+- **FreeRADIUS log destination** - switch the main log between `radius.log` and local syslog, pick the syslog facility, and choose whether authentication requests are logged. This edits only the `log { }` block of `radiusd.conf`; a one-time backup is kept as `radiusd.conf.frgui-bak`.
+- **Authentication events** - optionally sends one structured `key=value` line per Accept/Reject (user, client, NAS IP, calling station, certificate CN, EAP type, reject reason) to syslog with a facility and severity you choose. The Auth Log page keeps using its own log file and is unaffected.
+- **Remote syslog server** - FreeRADIUS 3.x can only log to the local syslog daemon, so forwarding is done with an rsyslog rule (`/etc/rsyslog.d/30-freeradius-gui.conf`) that relays messages from the `freeradius`/`radiusd` program to a host, port and protocol (UDP/TCP, RFC 5424 or 3164). The rule is validated with `rsyslogd -N1` before rsyslog is restarted and is rolled back if rejected. Requires `rsyslog` on the host. Syslog over UDP/TCP is unencrypted - use a trusted network or VPN.
+
+---
+
 ## Service management
 
 Check GUI service status:

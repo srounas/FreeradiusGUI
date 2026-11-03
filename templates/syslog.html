@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}Syslog - FreeRADIUS GUI{% endblock %}
+{% block content %}
+<h1>Syslog</h1>
+<p class="muted">Controls where FreeRADIUS sends its logs. Changes are written to the FreeRADIUS config
+  when you click <strong>Apply</strong> on the <a href="{{ url_for('dashboard') }}">Dashboard</a>.
+  The <a href="{{ url_for('auth_log') }}">Auth Log</a> page keeps reading its own log file and is not affected.</p>
+
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+  <div class="card">
+    <h2>FreeRADIUS log destination</h2>
+    <label>Send the main FreeRADIUS log to
+      <select name="destination">
+        <option value="files" {{ 'selected' if cfg.destination == 'files' }}>Log file (radius.log)</option>
+        <option value="syslog" {{ 'selected' if cfg.destination == 'syslog' }}>Local syslog</option>
+      </select>
+    </label>
+    <label>Syslog facility
+      <select name="facility">
+        {% for f in facilities %}
+        <option value="{{ f }}" {{ 'selected' if cfg.facility == f }}>{{ f }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="log_auth" {{ 'checked' if cfg.log_auth }}>
+      Log authentication requests (Login OK / Login incorrect)
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="log_auth_badpass" {{ 'checked' if cfg.log_auth_badpass }}>
+      Include the password on failed attempts <span class="muted">(avoid in production - logs secrets)</span>
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="log_auth_goodpass" {{ 'checked' if cfg.log_auth_goodpass }}>
+      Include the password on successful attempts <span class="muted">(avoid in production - logs secrets)</span>
+    </label>
+    <p class="muted">The syslog facility only applies when the destination is syslog. Writes the
+      <code>log { }</code> block in <code>radiusd.conf</code>.</p>
+  </div>
+
+  <div class="card">
+    <h2>Authentication events</h2>
+    <p class="muted">Sends one structured line per Accept / Reject (user, client, NAS IP, calling station,
+      certificate CN, EAP type, reject reason) to syslog, independent of the log destination above.</p>
+    <label class="checkbox">
+      <input type="checkbox" name="events_enabled" {{ 'checked' if cfg.events_enabled }}>
+      Send authentication events to syslog
+    </label>
+    <div class="inline" style="gap:16px; flex-wrap:wrap">
+      <label style="flex:1; min-width:160px">Facility
+        <select name="event_facility">
+          {% for f in facilities %}
+          <option value="{{ f }}" {{ 'selected' if cfg.event_facility == f }}>{{ f }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label style="flex:1; min-width:160px">Severity
+        <select name="event_severity">
+          {% for s in severities %}
+          <option value="{{ s }}" {{ 'selected' if cfg.event_severity == s }}>{{ s }}</option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Remote syslog server</h2>
+    <p class="muted">FreeRADIUS can only write to the <em>local</em> syslog daemon, so forwarding is done by
+      an rsyslog rule that picks up messages from FreeRADIUS and relays them to your collector. Local
+      logging continues as before.</p>
+    {% if not rsyslog_available %}
+    <div class="flash warn">rsyslog was not found on this host. Install it (<code>apt install rsyslog</code> /
+      <code>dnf install rsyslog</code>) or the forwarding rule will be skipped on Apply.</div>
+    {% endif %}
+    <label class="checkbox">
+      <input type="checkbox" name="remote_enabled" {{ 'checked' if cfg.remote_enabled }}>
+      Forward FreeRADIUS syslog messages to a remote server
+    </label>
+    <div class="inline" style="gap:16px; flex-wrap:wrap; align-items:flex-end">
+      <label style="flex:2; min-width:220px">Host or IP address
+        <input type="text" name="remote_host" value="{{ cfg.remote_host }}" placeholder="syslog.example.com">
+      </label>
+      <label style="flex:1; min-width:90px">Port
+        <input type="text" name="remote_port" value="{{ cfg.remote_port }}" inputmode="numeric">
+      </label>
+      <label style="flex:1; min-width:110px">Protocol
+        <select name="remote_protocol">
+          <option value="udp" {{ 'selected' if cfg.remote_protocol == 'udp' }}>UDP</option>
+          <option value="tcp" {{ 'selected' if cfg.remote_protocol == 'tcp' }}>TCP</option>
+        </select>
+      </label>
+      <label style="flex:1; min-width:140px">Message format
+        <select name="remote_format">
+          <option value="rfc5424" {{ 'selected' if cfg.remote_format == 'rfc5424' }}>RFC 5424</option>
+          <option value="rfc3164" {{ 'selected' if cfg.remote_format == 'rfc3164' }}>RFC 3164 (legacy)</option>
+        </select>
+      </label>
+    </div>
+    <p class="muted">Syslog over UDP/TCP is unencrypted. Send it over a trusted network or VPN.</p>
+  </div>
+
+  <button type="submit" class="primary">Save syslog settings</button>
+</form>
+{% endblock %}

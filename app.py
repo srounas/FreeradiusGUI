@@ -19,6 +19,7 @@ import os
 import pwd
 import re
 import secrets
+import shutil
 import socket
 import ssl
 import subprocess
@@ -1103,11 +1104,320 @@ def get_last_auth_event(log_file):
 
 
 # --------------------------------------------------------------------------
+# Syslog settings
+# --------------------------------------------------------------------------
+# Three independent pieces, all driven from one settings page:
+#   1. radiusd.conf log{} block - where FreeRADIUS's own log goes (file or
+#      local syslog), which facility it uses, and whether auth requests are
+#      logged at all.
+#   2. Structured auth events - two extra linelog modules (accept/reject)
+#      that write one key=value line per authentication to syslog. These are
+#      separate from the file-based modules behind the Auth Log page, so
+#      that page keeps working whatever is chosen here.
+#   3. Remote forwarding - FreeRADIUS 3.x can only talk to the *local*
+#      syslog daemon, so shipping messages to a collector is done with an
+#      rsyslog drop-in that matches FreeRADIUS's program name.
+
+SYSLOG_FACILITIES = ["daemon", "auth", "authpriv", "user"] + [f"local{i}" for i in range(8)]
+SYSLOG_SEVERITIES = ["debug", "info", "notice", "warning", "err"]
+SYSLOG_DEFAULTS = {
+    "destination": "files",        # radiusd.conf log { destination }: files | syslog
+    "facility": "daemon",          # log { syslog_facility }
+    "log_auth": False,             # log { auth }
+    "log_auth_badpass": False,     # log { auth_badpass }
+    "log_auth_goodpass": False,    # log { auth_goodpass }
+    "events_enabled": False,       # structured accept/reject events to syslog
+    "event_facility": "local1",
+    "event_severity": "info",
+    "remote_enabled": False,       # forward FreeRADIUS syslog to a collector via rsyslog
+    "remote_host": "",
+    "remote_port": 514,
+    "remote_protocol": "udp",      # udp | tcp
+    "remote_format": "rfc5424",    # rfc5424 | rfc3164
+}
+SYSLOG_EVENT_MODULES = ("linelog_syslog_accept", "linelog_syslog_reject")
+LINELOG_SYSLOG_CONF = RADDB / "mods-available" / "linelog_syslog"
+RSYSLOG_DROPIN = Path(STATE.get("rsyslog_dropin", "/etc/rsyslog.d/30-freeradius-gui.conf"))
+_HOSTNAME_RE = re.compile(
+    r'^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    r'(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$'
+)
+
+
+def get_syslog_settings():
+    cfg = dict(SYSLOG_DEFAULTS)
+    cfg.update(STATE.get("syslog") or {})
+    return cfg
+
+
+def parse_syslog_form(form):
+    """Validate the syslog form. Returns (settings_dict, [error strings]).
+    Every value ends up inside a config file FreeRADIUS or rsyslog parses,
+    so everything is checked against an allow-list or strict pattern - never
+    passed through as free text."""
+    errors = []
+    cfg = dict(SYSLOG_DEFAULTS)
+
+    cfg["destination"] = form.get("destination", "files")
+    if cfg["destination"] not in ("files", "syslog"):
+        errors.append("Log destination must be 'files' or 'syslog'")
+
+    cfg["facility"] = form.get("facility", "daemon")
+    if cfg["facility"] not in SYSLOG_FACILITIES:
+        errors.append("Invalid syslog facility")
+
+    cfg["log_auth"] = bool(form.get("log_auth"))
+    cfg["log_auth_badpass"] = bool(form.get("log_auth_badpass"))
+    cfg["log_auth_goodpass"] = bool(form.get("log_auth_goodpass"))
+
+    cfg["events_enabled"] = bool(form.get("events_enabled"))
+    cfg["event_facility"] = form.get("event_facility", "local1")
+    if cfg["event_facility"] not in SYSLOG_FACILITIES:
+        errors.append("Invalid facility for auth events")
+    cfg["event_severity"] = form.get("event_severity", "info")
+    if cfg["event_severity"] not in SYSLOG_SEVERITIES:
+        errors.append("Invalid severity for auth events")
+
+    cfg["remote_enabled"] = bool(form.get("remote_enabled"))
+    cfg["remote_host"] = form.get("remote_host", "").strip()
+    cfg["remote_protocol"] = form.get("remote_protocol", "udp")
+    if cfg["remote_protocol"] not in ("udp", "tcp"):
+        errors.append("Remote protocol must be UDP or TCP")
+    cfg["remote_format"] = form.get("remote_format", "rfc5424")
+    if cfg["remote_format"] not in ("rfc5424", "rfc3164"):
+        errors.append("Invalid remote message format")
+    try:
+        cfg["remote_port"] = int(form.get("remote_port", "514"))
+        if not 1 <= cfg["remote_port"] <= 65535:
+            raise ValueError
+    except ValueError:
+        errors.append("Remote port must be a number between 1 and 65535")
+        cfg["remote_port"] = 514
+
+    host = cfg["remote_host"]
+    if host:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            if not _HOSTNAME_RE.match(host):
+                errors.append(f"'{host}' is not a valid hostname or IP address")
+    elif cfg["remote_enabled"]:
+        errors.append("Enter a host or IP address for the remote syslog server")
+
+    return cfg, errors
+
+
+def _find_block(text, header_regex):
+    """Return (open_brace_index, close_brace_index) of the first block whose
+    opening line matches header_regex, ignoring braces in comment lines, or
+    None. Offsets index into the original text."""
+    masked = _mask_comments(text)
+    m = re.search(header_regex, masked, re.MULTILINE)
+    if not m:
+        return None
+    start = masked.index("{", m.start())
+    depth = 0
+    for i in range(start, len(masked)):
+        if masked[i] == "{":
+            depth += 1
+        elif masked[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return start, i
+    return None
+
+
+def _set_block_values(text, header_regex, values):
+    """Set key = value inside one named block only. Prefers an existing
+    active line, then un-comments the first commented one, and only then
+    appends. Returns (new_text, [messages]) or (text, None) if no block."""
+    span = _find_block(text, header_regex)
+    if span is None:
+        return text, None
+    start, end = span
+    block = text[start + 1:end]
+    messages = []
+    for key, value in values.items():
+        line = f"\t{key} = {value}"
+        active = re.compile(rf'^[ \t]*{re.escape(key)}[ \t]*=.*$', re.MULTILINE)
+        commented = re.compile(rf'^[ \t]*#[ \t]*{re.escape(key)}[ \t]*=.*$', re.MULTILINE)
+        if active.search(block):
+            block = active.sub(lambda _m: line, block, count=1)
+        elif commented.search(block):
+            block = commented.sub(lambda _m: line, block, count=1)
+        else:
+            tail = re.search(r'[ \t]*$', block).group(0)
+            body = block[:len(block) - len(tail)]
+            if not body.endswith("\n"):
+                body += "\n"
+            block = body + line + "\n" + tail
+        messages.append(f"{key} = {value}")
+    return text[:start + 1] + block + text[end:], messages
+
+
+def _remove_module_call(text, module_name):
+    new_text, n = re.subn(rf'^[ \t]*{re.escape(module_name)}[ \t]*\n', "", text, flags=re.MULTILINE)
+    return new_text, n > 0
+
+
+def apply_radiusd_log_settings(cfg):
+    """Write the log{} block of radiusd.conf. Keeps a one-time backup of the
+    pristine file next to it."""
+    if not RADIUSD_CONF.exists():
+        return ["radiusd.conf not found - skipped log destination settings"]
+    original = RADIUSD_CONF.read_text()
+    yn = lambda b: "yes" if b else "no"  # noqa: E731
+    values = {
+        "destination": cfg["destination"],
+        "syslog_facility": cfg["facility"],
+        "auth": yn(cfg["log_auth"]),
+        "auth_badpass": yn(cfg["log_auth_badpass"]),
+        "auth_goodpass": yn(cfg["log_auth_goodpass"]),
+    }
+    new_text, applied = _set_block_values(original, r'^[ \t]*log[ \t]*\{', values)
+    if applied is None:
+        return ["could not find the log { } block in radiusd.conf - set log destination manually"]
+    if new_text == original:
+        return ["radiusd.conf log{} block already up to date"]
+    backup = RADIUSD_CONF.with_name(RADIUSD_CONF.name + ".frgui-bak")
+    if not backup.exists():
+        backup.write_text(original)
+    RADIUSD_CONF.write_text(new_text)
+    return [f"radiusd.conf log{{}}: set {', '.join(applied)}",
+            f"(original saved once as {backup.name})"]
+
+
+def apply_syslog_event_hooks(cfg):
+    """Install or remove the structured accept/reject syslog events. Call
+    lines are removed *before* the module symlink on the way out so
+    freeradius -CX never sees a call to a module that isn't loaded."""
+    messages = []
+    link = MODS_ENABLED / "linelog_syslog"
+    accept_name, reject_name = SYSLOG_EVENT_MODULES
+
+    if not cfg["events_enabled"]:
+        if SITES_ENABLED_DEFAULT.exists():
+            text = SITES_ENABLED_DEFAULT.read_text()
+            changed = False
+            for name in SYSLOG_EVENT_MODULES:
+                text, did = _remove_module_call(text, name)
+                changed = changed or did
+            if changed:
+                SITES_ENABLED_DEFAULT.write_text(text)
+                messages.append("removed syslog event calls from sites-enabled/default")
+        if link.is_symlink() or link.exists():
+            link.unlink()
+            messages.append("removed mods-enabled/linelog_syslog")
+        if LINELOG_SYSLOG_CONF.exists():
+            LINELOG_SYSLOG_CONF.unlink()
+        return messages or ["syslog auth events disabled"]
+
+    fac, sev = cfg["event_facility"], cfg["event_severity"]
+    fmt_accept = (
+        "auth=Accept user='%{User-Name}' client='%{client:shortname}' "
+        "nas=%{Packet-Src-IP-Address} station='%{Calling-Station-Id}' "
+        "cert-cn='%{TLS-Client-Cert-Common-Name}' eap=%{EAP-Type}"
+    )
+    fmt_reject = (
+        "auth=Reject user='%{User-Name}' client='%{client:shortname}' "
+        "nas=%{Packet-Src-IP-Address} station='%{Calling-Station-Id}' "
+        "cert-cn='%{TLS-Client-Cert-Common-Name}' eap=%{EAP-Type} "
+        "reason='%{%{Module-Failure-Message}:-%{Reply-Message}}'"
+    )
+    LINELOG_SYSLOG_CONF.write_text(f"""# Managed by FreeRADIUS GUI - structured auth events to syslog
+linelog {accept_name} {{
+\tdestination = syslog
+\tsyslog_facility = {fac}
+\tsyslog_severity = {sev}
+\tformat = "{fmt_accept}"
+}}
+
+linelog {reject_name} {{
+\tdestination = syslog
+\tsyslog_facility = {fac}
+\tsyslog_severity = {sev}
+\tformat = "{fmt_reject}"
+}}
+""")
+    messages.append("wrote mods-available/linelog_syslog")
+    if not (link.exists() or link.is_symlink()):
+        os.symlink("../mods-available/linelog_syslog", link)
+        messages.append("created mods-enabled/linelog_syslog symlink")
+
+    if SITES_ENABLED_DEFAULT.exists():
+        text = SITES_ENABLED_DEFAULT.read_text()
+        text, m1 = _insert_module_call(text, r'^post-auth[ \t]*\{', accept_name)
+        text, m2 = _insert_module_call(text, r'^[ \t]*Post-Auth-Type[ \t]+REJECT[ \t]*\{', reject_name)
+        SITES_ENABLED_DEFAULT.write_text(text)
+        messages.extend([m1, m2])
+    else:
+        messages.append("sites-enabled/default not found - could not hook in syslog event calls")
+    return messages
+
+
+def apply_rsyslog_forwarding(cfg):
+    """Install/remove the rsyslog drop-in that ships FreeRADIUS's syslog
+    messages to a remote collector. Validated with rsyslogd -N1 before
+    rsyslog is restarted; a bad file is rolled back."""
+    messages = []
+    wanted = cfg["remote_enabled"] and cfg["remote_host"]
+
+    if not wanted:
+        if RSYSLOG_DROPIN.exists():
+            RSYSLOG_DROPIN.unlink()
+            rc, out = run(["systemctl", "restart", "rsyslog"])
+            messages.append("removed remote forwarding" + ("" if rc == 0 else f" (rsyslog restart failed: {out.strip()})"))
+        return messages
+
+    if not RSYSLOG_DROPIN.parent.is_dir() or not shutil.which("rsyslogd"):
+        return ["rsyslog is not installed on this host - remote forwarding was NOT configured "
+                "(install rsyslog, or forward from your existing syslog daemon instead)"]
+
+    template = "RSYSLOG_SyslogProtocol23Format" if cfg["remote_format"] == "rfc5424" else "RSYSLOG_TraditionalForwardFormat"
+    extra = ' action.resumeRetryCount="-1" queue.type="LinkedList" queue.size="10000"' if cfg["remote_protocol"] == "tcp" else ""
+    content = f"""# Managed by FreeRADIUS GUI - forwards FreeRADIUS syslog messages to a remote collector
+if ($programname == "freeradius" or $programname == "radiusd") then {{
+\taction(type="omfwd" target="{cfg['remote_host']}" port="{cfg['remote_port']}" protocol="{cfg['remote_protocol']}" template="{template}"{extra})
+}}
+"""
+    previous = RSYSLOG_DROPIN.read_text() if RSYSLOG_DROPIN.exists() else None
+    if previous == content:
+        return ["rsyslog forwarding already up to date"]
+
+    RSYSLOG_DROPIN.write_text(content)
+    rc, out = run(["rsyslogd", "-N1"])
+    if rc != 0:
+        if previous is None:
+            RSYSLOG_DROPIN.unlink()
+        else:
+            RSYSLOG_DROPIN.write_text(previous)
+        return ["rsyslog rejected the forwarding config - rolled back:", out.strip()]
+    rc, out = run(["systemctl", "restart", "rsyslog"])
+    if rc != 0:
+        return [f"wrote {RSYSLOG_DROPIN} but rsyslog restart failed: {out.strip()}"]
+    messages.append(f"forwarding FreeRADIUS syslog to {cfg['remote_host']}:{cfg['remote_port']}/{cfg['remote_protocol']}")
+    return messages
+
+
+def apply_syslog_settings(cfg, include_rsyslog=True):
+    log = ["--- syslog settings ---"]
+    log.extend(apply_radiusd_log_settings(cfg))
+    log.extend(apply_syslog_event_hooks(cfg))
+    if include_rsyslog:
+        log.extend(apply_rsyslog_forwarding(cfg))
+    return log
+
+
+# --------------------------------------------------------------------------
 # Status / health checks + pending-changes detection
 # --------------------------------------------------------------------------
 
 def compute_pending_hash():
     parts = [json.dumps(load_clients(), sort_keys=True)]
+    # Only once syslog has been configured, so existing installs don't show
+    # a spurious "unapplied changes" banner after upgrading.
+    if STATE.get("syslog"):
+        parts.append(json.dumps(STATE["syslog"], sort_keys=True))
     for p in eap_tls_paths().values():
         if p.exists():
             try:
@@ -1557,6 +1867,32 @@ def auth_log():
     return render_template(
         "auth_log.html", entries=entries, counts=counts, error=err,
         minutes=minutes, autorefresh=autorefresh, log_file=log_file,
+    )
+
+
+@app.route("/syslog", methods=["GET", "POST"])
+@login_required
+def syslog_settings():
+    cfg = get_syslog_settings()
+    if request.method == "POST":
+        new_cfg, errors = parse_syslog_form(request.form)
+        if errors:
+            for e in errors:
+                flash(e, "error")
+            cfg = new_cfg  # re-show what was typed instead of discarding it
+        else:
+            STATE["syslog"] = new_cfg
+            _persist_state()
+            if new_cfg["remote_enabled"] and new_cfg["destination"] != "syslog" and not new_cfg["events_enabled"]:
+                flash("Remote forwarding is on, but FreeRADIUS is logging to files and auth events are "
+                      "off - nothing will reach syslog. Set the log destination to syslog or enable "
+                      "auth events.", "warn")
+            flash("Syslog settings saved. Go to Dashboard and click Apply.", "success")
+            return redirect(url_for("syslog_settings"))
+    return render_template(
+        "syslog.html", cfg=cfg,
+        facilities=SYSLOG_FACILITIES, severities=SYSLOG_SEVERITIES,
+        rsyslog_available=bool(shutil.which("rsyslogd")),
     )
 
 
@@ -2152,6 +2488,7 @@ def validate():
             STATE.get("last_key_password", ""), paths["ca_bundle"],
         )
         log.extend(changes)
+    log.extend(apply_syslog_settings(get_syslog_settings(), include_rsyslog=False))
     rc, out = config_test()
     log.append("--- freeradius -CX output ---")
     log.append(out)
@@ -2183,6 +2520,9 @@ def apply():
     log.extend(linelog_messages)
     STATE["auth_log_file"] = log_file
 
+    syslog_cfg = get_syslog_settings()
+    log.extend(apply_syslog_settings(syslog_cfg, include_rsyslog=False))
+
     rc, out = config_test()
     log.append("--- freeradius -CX output ---")
     log.append(out)
@@ -2197,6 +2537,13 @@ def apply():
     log.append(out2 or "(no output)")
     success = rc2 == 0
     log.append("Service restarted successfully" if success else "Service restart FAILED")
+
+    # Remote forwarding is host-level (rsyslog), applied only once FreeRADIUS
+    # itself validated and restarted, so a collector problem can never block
+    # or roll back a RADIUS config change.
+    if success:
+        log.append("--- remote syslog forwarding ---")
+        log.extend(apply_rsyslog_forwarding(syslog_cfg))
 
     STATE["last_apply"] = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
