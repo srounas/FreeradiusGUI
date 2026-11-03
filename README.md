@@ -181,6 +181,12 @@ The **Syslog** page controls where FreeRADIUS sends its logs. Nothing changes on
 - **Authentication events** - optionally sends one structured `key=value` line per Accept/Reject (user, client, NAS IP, calling station, certificate CN, EAP type, reject reason) to syslog with a facility and severity you choose. The Auth Log page keeps using its own log file and is unaffected.
 - **Remote syslog server** - FreeRADIUS 3.x can only log to the local syslog daemon, so forwarding is done with an rsyslog rule (`/etc/rsyslog.d/30-freeradius-gui.conf`) that relays messages from the `freeradius`/`radiusd` program to a host, port and protocol (UDP/TCP, RFC 5424 or 3164). The rule is validated with `rsyslogd -N1` before rsyslog is restarted and is rolled back if rejected. Requires `rsyslog` on the host. Syslog over UDP/TCP is unencrypted - use a trusted network or VPN.
 
+Syslog settings are also part of the rest of the GUI's configuration handling:
+
+- **Changelog** - every change to the syslog settings (saving the page, importing a backup) takes a snapshot first, and reverting a snapshot restores the syslog settings along with clients and certificates. Snapshots from before this feature existed leave your current syslog settings untouched when reverted.
+- **Backup & Transfer** - export has a *Syslog settings* option (`syslog.json` in the zip), and import can replace the target server's settings. Imported values are validated with the same rules as the page; a malformed or tampered file is rejected. Tick *Keep this server's own remote syslog target* to import the log settings but leave the target server's remote host, port, protocol and format alone.
+- **Servers (config comparison)** - differences in syslog settings between servers are listed alongside clients and certificates. Settings that have no effect on either side (for example the remote host while forwarding is off on both) are not counted as differences. A peer still on an older version is reported as such rather than as a mismatch.
+
 ---
 
 ## Service management
