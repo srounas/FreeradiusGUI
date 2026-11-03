@@ -75,7 +75,7 @@ label {
   color: var(--muted);
 }
 
-input[type=text], input[type=password], textarea {
+input[type=text], input[type=password], textarea, select {
   display: block;
   width: 100%;
   margin-top: 6px;
