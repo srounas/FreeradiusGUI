@@ -144,6 +144,7 @@ If the repository directory no longer exists, clone it again:
 ```bash
 git clone https://github.com/srounas/FreeradiusGUI.git
 cd FreeradiusGUI
+chmod +x install.sh
 sudo ./install.sh
 ```
 
@@ -155,7 +156,7 @@ rm -rf FreeradiusGUI-main
 
 curl -fsSL https://github.com/srounas/FreeradiusGUI/archive/refs/heads/main.tar.gz | tar -xz
 cd FreeradiusGUI-main
-
+chmod +x install.sh
 sudo ./install.sh
 ```
 
